@@ -130,12 +130,12 @@ Two hosts were added to the "Config File":
 Host Caviness
     HostName caviness.hpc.udel.edu
     User frey
-    RemoteCommand /opt/shared/slurm/add-ons/vscode-shell-proxy/bin/vscode-shell-proxy.py -g it_nss --salloc-arg=--partition=devel --salloc-arg=--cpus-per-task=4
+    RemoteCommand <install-prefix>/bin/vscode-shell-proxy.py -g it_nss --salloc-arg=--partition=devel --salloc-arg=--cpus-per-task=4
 
 Host Caviness-verbose
     HostName caviness.hpc.udel.edu
     User frey
-    RemoteCommand /opt/shared/slurm/add-ons/vscode-shell-proxy/bin/vscode-shell-proxy.py -vvvv -g it_nss --salloc-arg=--partition=devel --salloc-arg=--cpus-per-task=4 -l /home/1001/.vscode-remote-shell.log.[PID] --tee-stdin=/home/1001/.vscode-stdin.log.[PID] --tee-stdout=/home/1001/.vscode-stdout.log.[PID] --tee-stderr=/home/1001/.vscode-stderr.log.[PID]
+    RemoteCommand <install-prefix>/bin/vscode-shell-proxy.py -vvvv -g it_nss --salloc-arg=--partition=devel --salloc-arg=--cpus-per-task=4 -l /home/1001/.vscode-remote-shell.log.[PID] --tee-stdin=/home/1001/.vscode-stdin.log.[PID] --tee-stdout=/home/1001/.vscode-stdout.log.[PID] --tee-stderr=/home/1001/.vscode-stderr.log.[PID]
 ```
 
 Both configurations used the **devel** partition on Caviness (which has a 2 hour wall time limit) and request 4 CPUs for the remote shell to use.  The latter configuration was used to debug issues while connecting with the VSCode application — the extensive logging is not recommended for normal use of this facility.
