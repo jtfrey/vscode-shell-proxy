@@ -1,4 +1,4 @@
-# vscode-slurm-proxy
+# vscode-shell-proxy
 
 Microsoft's Visual Studio Code (vscode) application has a **Remote-SSH** extension that allows for remote execution of code.  This is intended to allow the developer to edit/run/debug in the (eventual) target environment or access hardware not present in the local host (e.g. GPUs).
 
@@ -22,7 +22,7 @@ It was obvious from watching how the remote environment setup was effected that 
 
 Three extension settings had to be altered from their default:
 
-  - Reset "Config File" to something other than your default ssh file (you don't want regular `ssh` using these settings).
+  - Set "Config File" to something other than your default ssh file (you don't want regular `ssh` using these settings).
   - Raise "Connect Timeout" to ca. 300 seconds since the job scheduler may take some time to get the remote shell running.
   - *enable* "Enable Remote Command"
   - *enable* "Use Local Server"
@@ -110,3 +110,32 @@ options:
 For the sake of debugging, the `--tee-*` and `--log-file` flags were of critical importance.  The `--group` and `--salloc-arg` flags removed the hard-coded values present in the original scripts.
 
 The script worked:  intercepting the `listeningOn` line and holding it while the listener socket for the TCP proxying was added yielded (with "Enable Dynamic Forwarding" on) the originating connection's being able to connect to the TCP port!
+
+## Production setup
+
+The script requires Python 3.11, so a dedicated build of Python 3.11 was made from source and installed in `<install-prefix>/python-root`.  The proxy script was modified so that its hash-bang used `<install-prefix>/python-root/bin/python3` as its interpreter and the script was installed as `<install-prefix>/bin/vscode-shell-proxy.py`.
+
+The final settings used for the **Remote-SSH** extension were:
+
+  - Set "Config File" to something other than your default ssh file (you don't want regular `ssh` using these settings).
+  - Raise "Connect Timeout" to ca. 300 seconds since the job scheduler may take some time to get the remote shell running.
+  - *enable* "Enable Remote Command"
+  - *enable* "Use Local Server"
+  - *enable* "Enable Dynamic Forwarding"
+
+Two hosts were added to the "Config File":
+
+```
+# Read more about SSH config files: https://linux.die.net/man/5/ssh_config
+Host Caviness
+    HostName caviness.hpc.udel.edu
+    User frey
+    RemoteCommand /opt/shared/slurm/add-ons/vscode-shell-proxy/bin/vscode-shell-proxy.py -g it_nss --salloc-arg=--partition=devel --salloc-arg=--cpus-per-task=4
+
+Host Caviness-verbose
+    HostName caviness.hpc.udel.edu
+    User frey
+    RemoteCommand /opt/shared/slurm/add-ons/vscode-shell-proxy/bin/vscode-shell-proxy.py -vvvv -g it_nss --salloc-arg=--partition=devel --salloc-arg=--cpus-per-task=4 -l /home/1001/.vscode-remote-shell.log.[PID] --tee-stdin=/home/1001/.vscode-stdin.log.[PID] --tee-stdout=/home/1001/.vscode-stdout.log.[PID] --tee-stderr=/home/1001/.vscode-stderr.log.[PID]
+```
+
+Both configurations used the **devel** partition on Caviness (which has a 2 hour wall time limit) and request 4 CPUs for the remote shell to use.  The latter configuration was used to debug issues while connecting with the VSCode application — the extensive logging is not recommended for normal use of this facility.
