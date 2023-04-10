@@ -1,4 +1,4 @@
-# vscode-slurm-proxy
+# vscode-shell-proxy
 
 Microsoft's Visual Studio Code (vscode) application has a **Remote-SSH** extension that allows for remote execution of code.  This is intended to allow the developer to edit/run/debug in the (eventual) target environment or access hardware not present in the local host (e.g. GPUs).
 
@@ -22,7 +22,7 @@ It was obvious from watching how the remote environment setup was effected that 
 
 Three extension settings had to be altered from their default:
 
-  - Reset "Config File" to something other than your default ssh file (you don't want regular `ssh` using these settings).
+  - Set "Config File" to something other than your default ssh file (you don't want regular `ssh` using these settings).
   - Raise "Connect Timeout" to ca. 300 seconds since the job scheduler may take some time to get the remote shell running.
   - *enable* "Enable Remote Command"
   - *enable* "Use Local Server"
@@ -66,52 +66,76 @@ This turned out to not work:  at the same time that `listeningOn` text was being
 
 ## No more shell script
 
-At this point the procedure had outgrown implementation as Bash shell scripts.  Python supports the standard `select()`-oriented serial multiplexing of i/o (among many other schemes) and can easily intercept and forward stdin/stdout/stderr.  The new `vscode-remote-shell.py` script was far more complex and even had CLI flags that the vscode app could make use of:
+At this point the procedure had outgrown implementation as Bash shell scripts.  Python asyncio and threading can easily multiplex the forwarding of TCP ports and stdin/stdout/stderr.  The new `vscode-shell-proxy.py` script was far more complex and even had CLI flags that the vscode app could make use of:
 
 ```
-usage: vscode-remote-shell.py [-h] [-v] [-q] [-l <PATH>] [--tee-stdin <PATH>]
-                              [--tee-stdout <PATH>] [--tee-stderr <PATH>]
-                              [-b <N>] [-B <N>] [-p <N>] [-g <WORKGROUP>]
-                              [-S <SLURM-ARG>]
+usage: vscode-shell-proxy.py [-h] [-v] [-q] [-l <PATH>] [-0 <PATH>] [-1 <PATH>] [-2 <PATH>] [-b <N>] [-B <N>]
+                             [-H <HOSTNAME>] [-p <N>] [-g <WORKGROUP>] [-S <SLURM-ARG>]
 
-vscode cluster proxy
+vscode remote shell proxy
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   -v, --verbose         increase the level of output as the program executes
   -q, --quiet           decrease the level of output as the program executes
   -l <PATH>, --log-file <PATH>
-                        direct all logging to this file rather than stderr
-  --tee-stdin <PATH>    send a copy of input to the script stdin to this file
-  --tee-stdout <PATH>   send a copy of output to the script stdout to this
-                        file
-  --tee-stderr <PATH>   send a copy of output to the script stderr to this
-                        file
+                        direct all logging to this file rather than stderr; the token "[PID]" will be replaced with
+                        the running pid
+  -0 <PATH>, --tee-stdin <PATH>
+                        send a copy of input to the script stdin to this file; the token "[PID]" will be replaced with
+                        the running pid
+  -1 <PATH>, --tee-stdout <PATH>
+                        send a copy of output to the script stdout to this file; the token "[PID]" will be replaced
+                        with the running pid
+  -2 <PATH>, --tee-stderr <PATH>
+                        send a copy of output to the script stderr to this file; the token "[PID]" will be replaced
+                        with the running pid
   -b <N>, --backlog <N>
-                        number of backlogged connections held by the proxy
-                        socket (see man page for listen(), default 8)
+                        number of backlogged connections held by the proxy socket (see man page for listen(), default
+                        8)
   -B <N>, --byte-limit <N>
-                        maximum bytes read at one time per socket (default
-                        4096
+                        maximum bytes read at one time per socket (default 4096
+  -H <HOSTNAME>, --listen-host <HOSTNAME>
+                        the client-facing TCP proxy should bind to this interface (default 127.0.0.1; use 0.0.0.0 for
+                        all interfaces)
   -p <N>, --listen-port <N>
-                        the client-facing TCP proxy port (default 0 implies a
-                        random port is chosen)
+                        the client-facing TCP proxy port (default 0 implies a random port is chosen)
   -g <WORKGROUP>, --group <WORKGROUP>, --workgroup <WORKGROUP>
                         the workgroup used to submit the vscode job
   -S <SLURM-ARG>, --salloc-arg <SLURM-ARG>
-                        used zero or more times to specify arguments to the
-                        salloc command being wrapped (e.g. --partition=<name>,
-                        --ntasks=<N>)
+                        used zero or more times to specify arguments to the salloc command being wrapped (e.g.
+                        --partition=<name>, --ntasks=<N>)
 ```
 
 For the sake of debugging, the `--tee-*` and `--log-file` flags were of critical importance.  The `--group` and `--salloc-arg` flags removed the hard-coded values present in the original scripts.
 
-The script worked:  intercepting the `listeningOn` line and holding it while the listener socket for the TCP proxying was added yielded (with "Enable Dynamic Forwarding" on) the originating connection's being able to connect to the TCP port!  But this did not equate with success.
+The script worked:  intercepting the `listeningOn` line and holding it while the listener socket for the TCP proxying was added yielded (with "Enable Dynamic Forwarding" on) the originating connection's being able to connect to the TCP port!
 
-## The mechanism revealed
+## Production setup
 
-The `vscode-remote-shell.py` proxy worked as expected — so why wasn't the vscode app happy?  It turns out this is tied to the **Remote-SSH** remote code's reconnect capability.  Their scripts are executed with no controlling terminal, so when the connection drops they receive no SIGHUP and keep running.  When the vscode app reconnects to the remote system it cannot hook into the stdin/stdout/stderr of those programs:  that's why the TCP port is there.
+The script requires Python 3.11, so a dedicated build of Python 3.11 was made from source and installed in `<install-prefix>/python-root`.  The proxy script was modified so that its hash-bang used `<install-prefix>/python-root/bin/python3` as its interpreter and the script was installed as `<install-prefix>/bin/vscode-shell-proxy.py`.
 
-Anecdotal evidence shows that after establishing the new remote session on the remote host, the vscode app purposefully closes the connection.  It then attempts a reconnect via the TCP port so that all **Remote-SSH** infrastructure post-setup happens via the HTTP-like protocol.  Unfortunately when it drops that originating connection, the `salloc` interactive job is terminated and the session goes away.
+The final settings used for the **Remote-SSH** extension were:
 
-In the end, by construction the **Remote-SSH** plugin doesn't lend itself to this kind of automation and integration with HPC systems.
+  - Set "Config File" to something other than your default ssh file (you don't want regular `ssh` using these settings).
+  - Raise "Connect Timeout" to ca. 300 seconds since the job scheduler may take some time to get the remote shell running.
+  - *enable* "Enable Remote Command"
+  - *enable* "Use Local Server"
+  - *enable* "Enable Dynamic Forwarding"
+
+Two hosts were added to the "Config File":
+
+```
+# Read more about SSH config files: https://linux.die.net/man/5/ssh_config
+Host Caviness
+    HostName caviness.hpc.udel.edu
+    User frey
+    RemoteCommand <install-prefix>/bin/vscode-shell-proxy.py -g it_nss --salloc-arg=--partition=devel --salloc-arg=--cpus-per-task=4
+
+Host Caviness-verbose
+    HostName caviness.hpc.udel.edu
+    User frey
+    RemoteCommand <install-prefix>/bin/vscode-shell-proxy.py -vvvv -g it_nss --salloc-arg=--partition=devel --salloc-arg=--cpus-per-task=4 -l /home/1001/.vscode-remote-shell.log.[PID] --tee-stdin=/home/1001/.vscode-stdin.log.[PID] --tee-stdout=/home/1001/.vscode-stdout.log.[PID] --tee-stderr=/home/1001/.vscode-stderr.log.[PID]
+```
+
+Both configurations used the **devel** partition on Caviness (which has a 2 hour wall time limit) and request 4 CPUs for the remote shell to use.  The latter configuration was used to debug issues while connecting with the VSCode application — the extensive logging is not recommended for normal use of this facility.
