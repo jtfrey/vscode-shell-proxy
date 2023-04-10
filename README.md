@@ -66,52 +66,47 @@ This turned out to not work:  at the same time that `listeningOn` text was being
 
 ## No more shell script
 
-At this point the procedure had outgrown implementation as Bash shell scripts.  Python supports the standard `select()`-oriented serial multiplexing of i/o (among many other schemes) and can easily intercept and forward stdin/stdout/stderr.  The new `vscode-remote-shell.py` script was far more complex and even had CLI flags that the vscode app could make use of:
+At this point the procedure had outgrown implementation as Bash shell scripts.  Python asyncio and threading can easily multiplex the forwarding of TCP ports and stdin/stdout/stderr.  The new `vscode-shell-proxy.py` script was far more complex and even had CLI flags that the vscode app could make use of:
 
 ```
-usage: vscode-remote-shell.py [-h] [-v] [-q] [-l <PATH>] [--tee-stdin <PATH>]
-                              [--tee-stdout <PATH>] [--tee-stderr <PATH>]
-                              [-b <N>] [-B <N>] [-p <N>] [-g <WORKGROUP>]
-                              [-S <SLURM-ARG>]
+usage: vscode-shell-proxy.py [-h] [-v] [-q] [-l <PATH>] [-0 <PATH>] [-1 <PATH>] [-2 <PATH>] [-b <N>] [-B <N>]
+                             [-H <HOSTNAME>] [-p <N>] [-g <WORKGROUP>] [-S <SLURM-ARG>]
 
-vscode cluster proxy
+vscode remote shell proxy
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   -v, --verbose         increase the level of output as the program executes
   -q, --quiet           decrease the level of output as the program executes
   -l <PATH>, --log-file <PATH>
-                        direct all logging to this file rather than stderr
-  --tee-stdin <PATH>    send a copy of input to the script stdin to this file
-  --tee-stdout <PATH>   send a copy of output to the script stdout to this
-                        file
-  --tee-stderr <PATH>   send a copy of output to the script stderr to this
-                        file
+                        direct all logging to this file rather than stderr; the token "[PID]" will be replaced with
+                        the running pid
+  -0 <PATH>, --tee-stdin <PATH>
+                        send a copy of input to the script stdin to this file; the token "[PID]" will be replaced with
+                        the running pid
+  -1 <PATH>, --tee-stdout <PATH>
+                        send a copy of output to the script stdout to this file; the token "[PID]" will be replaced
+                        with the running pid
+  -2 <PATH>, --tee-stderr <PATH>
+                        send a copy of output to the script stderr to this file; the token "[PID]" will be replaced
+                        with the running pid
   -b <N>, --backlog <N>
-                        number of backlogged connections held by the proxy
-                        socket (see man page for listen(), default 8)
+                        number of backlogged connections held by the proxy socket (see man page for listen(), default
+                        8)
   -B <N>, --byte-limit <N>
-                        maximum bytes read at one time per socket (default
-                        4096
+                        maximum bytes read at one time per socket (default 4096
+  -H <HOSTNAME>, --listen-host <HOSTNAME>
+                        the client-facing TCP proxy should bind to this interface (default 127.0.0.1; use 0.0.0.0 for
+                        all interfaces)
   -p <N>, --listen-port <N>
-                        the client-facing TCP proxy port (default 0 implies a
-                        random port is chosen)
+                        the client-facing TCP proxy port (default 0 implies a random port is chosen)
   -g <WORKGROUP>, --group <WORKGROUP>, --workgroup <WORKGROUP>
                         the workgroup used to submit the vscode job
   -S <SLURM-ARG>, --salloc-arg <SLURM-ARG>
-                        used zero or more times to specify arguments to the
-                        salloc command being wrapped (e.g. --partition=<name>,
-                        --ntasks=<N>)
+                        used zero or more times to specify arguments to the salloc command being wrapped (e.g.
+                        --partition=<name>, --ntasks=<N>)
 ```
 
 For the sake of debugging, the `--tee-*` and `--log-file` flags were of critical importance.  The `--group` and `--salloc-arg` flags removed the hard-coded values present in the original scripts.
 
-The script worked:  intercepting the `listeningOn` line and holding it while the listener socket for the TCP proxying was added yielded (with "Enable Dynamic Forwarding" on) the originating connection's being able to connect to the TCP port!  But this did not equate with success.
-
-## The mechanism revealed
-
-The `vscode-remote-shell.py` proxy worked as expected — so why wasn't the vscode app happy?  It turns out this is tied to the **Remote-SSH** remote code's reconnect capability.  Their scripts are executed with no controlling terminal, so when the connection drops they receive no SIGHUP and keep running.  When the vscode app reconnects to the remote system it cannot hook into the stdin/stdout/stderr of those programs:  that's why the TCP port is there.
-
-Anecdotal evidence shows that after establishing the new remote session on the remote host, the vscode app purposefully closes the connection.  It then attempts a reconnect via the TCP port so that all **Remote-SSH** infrastructure post-setup happens via the HTTP-like protocol.  Unfortunately when it drops that originating connection, the `salloc` interactive job is terminated and the session goes away.
-
-In the end, by construction the **Remote-SSH** plugin doesn't lend itself to this kind of automation and integration with HPC systems.
+The script worked:  intercepting the `listeningOn` line and holding it while the listener socket for the TCP proxying was added yielded (with "Enable Dynamic Forwarding" on) the originating connection's being able to connect to the TCP port!
