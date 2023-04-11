@@ -41,6 +41,10 @@ targetPort = None
 # it is listening:
 targetPortRegex = re.compile(r'^([^0-9]*listeningOn=[^0-9]*)([0-9][0-9]*)([^0-9]*)$')
 
+# Regex for input lines containing references to running servers bound to the
+# localhost interface only:
+localhostFixupRegex = re.compile(r'((\$args =.*)|(\$VSCH_SERVER_SCRIPT.*))--host=127.0.0.1')
+
 # Any commands this script itself sends to the remote shell should have their output
 # prefixed with this text to indicate they are NOT in response to VSCode application
 # commands:
@@ -131,7 +135,7 @@ def start_tcp_proxy(loop):
 
 def stdinProxyThread(drain, copyToFile=None):
     """Target function for a thread that will consume input from this script's stdin and write it to the remote shell's stdin.  Before any forwarding begins, introspective command(s) associated with this script are sent (and their output will be consumed by the stdout-forwarding thread).  When EOF is reached on this script's stdin the state is forwarded to END, yielding the shutdown of this script -- the connection from the VSCode application has been severed."""
-    global proxyStateCond, proxyState
+    global proxyStateCond, proxyState, localhostFixupRegex
     
     # Start by sending our special `hostname` command:
     hostnameCmd = 'echo "{:s}HOSTNAME=$(hostname)"\n'.format(ourShellOutputPrefix)
@@ -140,20 +144,25 @@ def stdinProxyThread(drain, copyToFile=None):
     drain.write(hostnameCmd); drain.flush()
     logging.debug('Wrote startup command to remote shell: %s', hostnameCmd.strip())
     
-    if copyToFile is not None:
-        while True:
-            logging.debug('Waiting on stdin...')
-            inputLine = sys.stdin.readline()
-            if not inputLine:
-                break
+    while True:
+        logging.debug('Waiting on stdin...')
+        inputLine = sys.stdin.readline()
+        if not inputLine:
+            break
+        
+        # Localhost fixups?
+        if '--host=127.0.0.1' in inputLine:
+            # Confirm it's one of the lines we're expecting:
+            localhostFixupMatch = localhostFixupRegex.search(inputLine)
+            if localhostFixupMatch is None:
+                logging.warning('unanticipated localhost line found: %s', inputLine.strip())
+            else:
+                logging.debug('localhost line found and fixed: %s', inputLine.strip())
+                inputLine = inputLine.replace('127.0.0.1', '0.0.0.0')
+        
+        if copyToFile is not None:
             copyToFile.write(inputLine); copyToFile.flush()
-            drain.write(inputLine); drain.flush()
-    else:
-        while True:
-            inputLine = sys.stdin.readline()
-            if not inputLine:
-                break
-            drain.write(inputLine); drain.flush()
+        drain.write(inputLine); drain.flush()
 
     # All done, let everyone know:
     with proxyStateCond:

@@ -23,7 +23,7 @@ It was obvious from watching how the remote environment setup was effected that 
 Three extension settings had to be altered from their default:
 
   - Set "Config File" to something other than your default ssh file (you don't want regular `ssh` using these settings).
-  - Raise "Connect Timeout" to ca. 300 seconds since the job scheduler may take some time to get the remote shell running.
+  - Raise "Connect Timeout" to e.g. 300 seconds since the job scheduler may take some time to get the remote shell running.
   - *enable* "Enable Remote Command"
   - *enable* "Use Local Server"
 
@@ -109,7 +109,13 @@ options:
 
 For the sake of debugging, the `--tee-*` and `--log-file` flags were of critical importance.  The `--group` and `--salloc-arg` flags removed the hard-coded values present in the original scripts.
 
-The script worked:  intercepting the `listeningOn` line and holding it while the listener socket for the TCP proxying was added yielded (with "Enable Dynamic Forwarding" on) the originating connection's being able to connect to the TCP port!
+The script worked:  intercepting the `listeningOn` line and holding it while the listener socket for the TCP proxying was added yielded (with "Enable Dynamic Forwarding" on) the originating connection's being able to connect to the TCP port on the login node.
+
+But the proxy script could not connect to the TCP port on the compute node that the vscode backend had reported.  After an embarrasing number of false starts to debug the problem, a `ps` on the compute node revealed the problem:  the TCP port was bound to 127.0.0.1.  The **Remote-SSH** extension sends the commands to start the backend scripts with `--host=127.0.0.1` among the flags.  The scripts in question will happily accept `--host=0.0.0.0` instead and bind to all TCP interfaces on the compute node.
+
+Binding to `localhost` implies a TCP port is only reachable on the machine itself.  But beyond that, anyone with an account on the machine can connect to that TCP port so there's no security beyond isolation from the Internet.  Since most computers these days run local firewalling software that accomplishes the same isolation — our clusters' login nodes included — the software gains no additional security binding to `localhost` versus every interface (`0.0.0.0`).  Since the proxy script is already receiving and forwarding stdin from the VSCode application, it was very easy to introduce code to catch the commands containing the offending `--host=127.0.0.1` and alter it to `--host=0.0.0.0` before forwarding the command to the remote shell.
+
+With that change, the proxy worked perfectly.  Additional testing with user-forwarded ports in the VSCode application demonstrated that under this setup, there was no additional code necessary for that feature.
 
 ## Production setup
 
@@ -118,7 +124,7 @@ The script requires Python 3.11, so a dedicated build of Python 3.11 was made fr
 The final settings used for the **Remote-SSH** extension were:
 
   - Set "Config File" to something other than your default ssh file (you don't want regular `ssh` using these settings).
-  - Raise "Connect Timeout" to ca. 300 seconds since the job scheduler may take some time to get the remote shell running.
+  - Raise "Connect Timeout" to e.g. 300 seconds since the job scheduler may take some time to get the remote shell running.
   - *enable* "Enable Remote Command"
   - *enable* "Use Local Server"
   - *enable* "Enable Dynamic Forwarding"
@@ -139,3 +145,33 @@ Host Caviness-verbose
 ```
 
 Both configurations used the **devel** partition on Caviness (which has a 2 hour wall time limit) and request 4 CPUs for the remote shell to use.  The latter configuration was used to debug issues while connecting with the VSCode application — the extensive logging is not recommended for normal use of this facility.
+
+### Simpler invocation
+
+Having such a lengthy path in the RemoteCommand to use `vscode-shell-proxy.py` may produce some user error.  For the sake of simplifying its usage, a symbolic link `vscode-shell-proxy` was added to `/usr/local/bin` on the login nodes.  An example host configuration becomes:
+
+```
+Host Caviness
+    HostName caviness.hpc.udel.edu
+    User frey
+    RemoteCommand vscode-shell-proxy -g it_nss --salloc-arg=--partition=devel --salloc-arg=--cpus-per-task=4
+```
+
+### X11 forwarding
+
+The **Remote-SSH** extension includes an option that will honor X11 forwarding configuration options present in the ssh host configuration file:
+
+```
+Host Caviness+X11
+    HostName caviness.hpc.udel.edu
+    User frey
+    ForwardX11 yes
+    ForwardX11Trusted yes
+    RemoteCommand vscode-shell-proxy -g it_nss --salloc-arg=--partition=devel --salloc-arg=--cpus-per-task=4 --salloc-arg=--x11
+```
+
+In the **Remote-SSH** extension configuration:
+
+  - *enable* "Enable X11 Forwarding"
+
+With a local X11 server running next to the VSCode application, the remote side of the ssh connection will have `DISPLAY` configured in its environment.  When the `salloc` command is executed in that remote environment, the `--x11` flag can be added (using `--salloc-arg=--x11` in the RemoteCommand) and Slurm itself will handle forwarding of X11 traffic between the compute node and login node — where the ssh connection will forward between the login node and your computer.
