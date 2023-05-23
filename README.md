@@ -175,3 +175,9 @@ In the **Remote-SSH** extension configuration:
   - *enable* "Enable X11 Forwarding"
 
 With a local X11 server running next to the VSCode application, the remote side of the ssh connection will have `DISPLAY` configured in its environment.  When the `salloc` command is executed in that remote environment, the `--x11` flag can be added (using `--salloc-arg=--x11` in the RemoteCommand) and Slurm itself will handle forwarding of X11 traffic between the compute node and login node — where the ssh connection will forward between the login node and your computer.
+
+## Periodic Cleanup
+
+Anyone supporting users on HPC resources knows that documenting the appropriate way to do something on the system doesn't mean all users will find that information, read it, and employ it in their workflows.  With **Remote-SSH**, users who discover the tool will inevitably follow Microsoft's instructions and wind up leaving behind orphaned sessions on the login nodes, which will be noticed and prompt IT staff's contacting them to correct their behavior.
+
+The [vscode-cleanup.py](./vscode-cleanup.py) script attempts to help the situation by identifying vscode process trees whose root process is orphaned (ppid 1) and killing that process and its descendents.
