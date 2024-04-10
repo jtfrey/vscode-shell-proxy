@@ -39,11 +39,12 @@ targetPort = None
 
 # Regex for the line output by the vscode backend indicating the TCP port on which
 # it is listening:
-targetPortRegex = re.compile(r'^([^0-9]*listeningOn=[^0-9]*)([0-9][0-9]*)([^0-9]*)$')
+targetPortRegex = re.compile(r'^([^0-9]*listeningOn=[^0-9]*)(([0-9][0-9]*\.){3}[0-9][0-9]*:)?([0-9][0-9]*)([^0-9]*)$')
 
 # Regex for input lines containing references to running servers bound to the
 # localhost interface only:
-localhostFixupRegex = re.compile(r'((\$args =.*)|(\$VSCH_SERVER_SCRIPT.*))--host=127.0.0.1')
+localhostFixupNodeJSRegex = re.compile(r'((\$args =.*)|(\$VSCH_SERVER_SCRIPT.*))--host=127.0.0.1')
+localhostFixupCLIRegex = re.compile(r'(VSCODE_CLI_REQUIRE_TOKEN=[0-9a-fA-F-]*.*\$CLI_PATH.*command-shell )(.*)(--on-host=(([0-9][0-9]*\.){3}[0-9][0-9]*))?')
 
 # Any commands this script itself sends to the remote shell should have their output
 # prefixed with this text to indicate they are NOT in response to VSCode application
@@ -135,7 +136,7 @@ def start_tcp_proxy(loop):
 
 def stdinProxyThread(drain, copyToFile=None):
     """Target function for a thread that will consume input from this script's stdin and write it to the remote shell's stdin.  Before any forwarding begins, introspective command(s) associated with this script are sent (and their output will be consumed by the stdout-forwarding thread).  When EOF is reached on this script's stdin the state is forwarded to END, yielding the shutdown of this script -- the connection from the VSCode application has been severed."""
-    global proxyStateCond, proxyState, localhostFixupRegex
+    global proxyStateCond, proxyState, localhostFixupNodeJSRegex, localhostFixupCLIRegex
     
     # Start by sending our special `hostname` command:
     hostnameCmd = 'echo "{:s}HOSTNAME=$(hostname)"\n'.format(ourShellOutputPrefix)
@@ -153,12 +154,20 @@ def stdinProxyThread(drain, copyToFile=None):
         # Localhost fixups?
         if '--host=127.0.0.1' in inputLine:
             # Confirm it's one of the lines we're expecting:
-            localhostFixupMatch = localhostFixupRegex.search(inputLine)
+            localhostFixupMatch = localhostFixupNodeJSRegex.search(inputLine)
             if localhostFixupMatch is None:
                 logging.warning('unanticipated localhost line found: %s', inputLine.strip())
             else:
                 logging.debug('localhost line found and fixed: %s', inputLine.strip())
                 inputLine = inputLine.replace('127.0.0.1', '0.0.0.0')
+        elif '"$CLI_PATH" command-shell' in inputLine:
+            # Confirm it's one of the lines we're expecting:
+            localhostFixupMatch = localhostFixupCLIRegex.search(inputLine)
+            if localhostFixupMatch is None:
+                logging.warning('unanticipated localhost line found: %s', inputLine.strip())
+            else:
+                logging.debug('localhost line found and fixed: %s', inputLine.strip())
+                inputLine = re.sub(localhostFixupCLIRegex, r'\g<1> --on-host=0.0.0.0 \g<2>', inputLine)
         
         if copyToFile is not None:
             copyToFile.write(inputLine); copyToFile.flush()
@@ -193,6 +202,8 @@ def stdoutProxyThread(faucet, copyToFile=None):
     """Consume output to the remote shell's stdout and write it to this script's stdout.  This function is far more complex compared to the stderrProxyThread() function:  the stdout lines must be scanned for output associated with commands issued by this script (e.g. to get the remote hostname) and the remote TCP port on which the vscode backend is listening.  Once those data are known, this script's TCP proxy can be started.  When EOF is reached on the remote shell's stdout the state is forwarded to END, yielding the shutdown of this script -- the connection to the remote shell has been severed."""
     global targetHost, targetPort, targetPortRegex, proxyStateCond, proxyState
     
+    listenOnHadHost = False
+    
     while True:
         logging.debug('Waiting on remote stdout...')
         outputLine = faucet.readline()
@@ -219,7 +230,8 @@ def stdoutProxyThread(faucet, copyToFile=None):
                 logging.debug('Remote vscode TCP listener port found: %s', outputLine.strip())
                 targetPortMatch = targetPortRegex.search(outputLine)
                 if targetPortMatch is not None:
-                    targetPort = int(targetPortMatch.group(2))
+                    targetPort = int(targetPortMatch.group(4))
+                    listenOnHadHost = (len(targetPortMatch.group(2)) > 0)
                     logging.info('Remote TCP port found:  %d', targetPort)
                 
                 # Don't print the line now, stash it for output once the TCP proxy
@@ -240,7 +252,8 @@ def stdoutProxyThread(faucet, copyToFile=None):
                 proxyStateCond.wait_for(lambda:checkProxyState(ProxyStates.PROXY_STARTED))
     
             # Reformat the line with the local listening port:
-            targetPortLine = re.sub(targetPortRegex, r'\g<1>{:d}\g<3>'.format(proxyPort), targetPortLine)
+            targetHostStr = '127.0.0.1:' if listenOnHadHost else ''
+            targetPortLine = re.sub(targetPortRegex, r'\g<1>{:s}{:d}\g<5>'.format(targetHostStr, proxyPort), targetPortLine)
             logging.debug('Remote vscode TCP listener line rewritten: %s', targetPortLine.strip())
         
             if copyToFile:

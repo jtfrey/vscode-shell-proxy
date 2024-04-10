@@ -117,6 +117,10 @@ Binding to `localhost` implies a TCP port is only reachable on the machine itsel
 
 With that change, the proxy worked perfectly.  Additional testing with user-forwarded ports in the VSCode application demonstrated that under this setup, there was no additional code necessary for that feature.
 
+### Changes for the Binary Exec Server
+
+The situation changed in early 2024 when Microsoft began deploying a binary remote agent ("exec server") in lieu of the node.js agent previously used.  The exec server defaults to binding to 127.0.0.1 and no equivalent to the traditional variant's `--host` flag was initially made available.  An [issue was filed](https://github.com/microsoft/vscode-remote-release/issues/9713) and Microsoft did eventually add an `--on-host` flag to the exec server, which allowed vscode-shell-proxy to be altered to fixup the startup command to bind to 0.0.0.0 instead.  As of 2024-04-10 this functionality was only available in the VSCode Insiders release stream, but eventually it should make it into the mainstream releases, too.
+
 ## Production setup
 
 The script requires Python 3.11, so a dedicated build of Python 3.11 was made from source and installed in `<install-prefix>/python-root`.  The proxy script was modified so that its hash-bang used `<install-prefix>/python-root/bin/python3` as its interpreter and the script was installed as `<install-prefix>/bin/vscode-shell-proxy.py`.
