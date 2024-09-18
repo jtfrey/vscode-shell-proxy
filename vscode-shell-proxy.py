@@ -1,4 +1,4 @@
-#!/opt/shared/slurm/add-ons/vscode-shell-proxy/python-root/bin/python3
+#!/usr/bin/env python3
 #
 # This script acts as a proxy for the Microsoft Visual Studio Code application's
 # Remote-SSH extension.  Remote-SSH must be setup to allow for remote command to
@@ -44,7 +44,8 @@ targetPortRegex = re.compile(r'^([^0-9]*listeningOn=[^0-9]*)(([0-9][0-9]*\.){3}[
 # Regex for input lines containing references to running servers bound to the
 # localhost interface only:
 localhostFixupNodeJSRegex = re.compile(r'((\$args =.*)|(\$VSCH_SERVER_SCRIPT.*))--host=127.0.0.1')
-localhostFixupCLIRegex = re.compile(r'(VSCODE_CLI_REQUIRE_TOKEN=[0-9a-fA-F-]*.*\$CLI_PATH.*command-shell )(.*)(--on-host=(([0-9][0-9]*\.){3}[0-9][0-9]*))?')
+localhostFixupCLIListenArgsRegex = re.compile(r'(LISTEN_ARGS=".*)(--on-host=(([0-9][0-9]*\.){3}[0-9][0-9]*))')
+localhostFixupCLICmdRegex = re.compile(r'(VSCODE_CLI_REQUIRE_TOKEN=[0-9a-fA-F-]*.*\$CLI_PATH.*command-shell )(.*)(--on-host=(([0-9][0-9]*\.){3}[0-9][0-9]*))')
 
 # Any commands this script itself sends to the remote shell should have their output
 # prefixed with this text to indicate they are NOT in response to VSCode application
@@ -136,7 +137,10 @@ def start_tcp_proxy(loop):
 
 def stdinProxyThread(drain, copyToFile=None):
     """Target function for a thread that will consume input from this script's stdin and write it to the remote shell's stdin.  Before any forwarding begins, introspective command(s) associated with this script are sent (and their output will be consumed by the stdout-forwarding thread).  When EOF is reached on this script's stdin the state is forwarded to END, yielding the shutdown of this script -- the connection from the VSCode application has been severed."""
-    global proxyStateCond, proxyState, localhostFixupNodeJSRegex, localhostFixupCLIRegex
+    global proxyStateCond, proxyState, localhostFixupNodeJSRegex, localhostFixupCLICmdRegex
+    global localhostFixupCLIListenArgsRegex
+
+    hasCLIListenArgs = False
     
     # Start by sending our special `hostname` command:
     hostnameCmd = 'echo "{:s}HOSTNAME=$(hostname)"\n'.format(ourShellOutputPrefix)
@@ -160,14 +164,23 @@ def stdinProxyThread(drain, copyToFile=None):
             else:
                 logging.debug('localhost line found and fixed: %s', inputLine.strip())
                 inputLine = inputLine.replace('127.0.0.1', '0.0.0.0')
-        elif '"$CLI_PATH" command-shell' in inputLine:
+        elif not hasCLIListenArgs and '"$CLI_PATH" command-shell' in inputLine:
             # Confirm it's one of the lines we're expecting:
-            localhostFixupMatch = localhostFixupCLIRegex.search(inputLine)
+            localhostFixupMatch = localhostFixupCLICmdRegex.search(inputLine)
             if localhostFixupMatch is None:
                 logging.warning('unanticipated localhost line found: %s', inputLine.strip())
             else:
                 logging.debug('localhost line found and fixed: %s', inputLine.strip())
-                inputLine = re.sub(localhostFixupCLIRegex, r'\g<1> --on-host=0.0.0.0 \g<2>', inputLine)
+                inputLine = re.sub(localhostFixupCLICmdRegex, r'\g<1> --on-host=0.0.0.0 \g<2>', inputLine)
+        elif 'LISTEN_ARGS=' in inputLine:
+            # Confirm it's the line we're expecting:
+            localhostFixupMatch = localhostFixupCLIListenArgsRegex.search(inputLine)
+            if ( localhostFixupMatch is None ):
+                logging.warning('unanticipated localhost line found: %s', inputLine.strip())
+            else:
+                logging.debug('localhost line found and fixed: %s', inputLine.strip())
+                inputLine = re.sub(localhostFixupCLIListenArgsRegex, r'\g<1> --on-host=0.0.0.0 ', inputLine)
+                hasCLIListenArgs = True
         
         if copyToFile is not None:
             copyToFile.write(inputLine); copyToFile.flush()
