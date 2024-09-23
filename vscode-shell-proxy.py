@@ -244,8 +244,9 @@ def stdoutProxyThread(faucet, copyToFile=None):
                 targetPortMatch = targetPortRegex.search(outputLine)
                 if targetPortMatch is not None:
                     targetPort = int(targetPortMatch.group(4))
-                    listenOnHadHost = (len(targetPortMatch.group(2)) > 0)
                     logging.info('Remote TCP port found:  %d', targetPort)
+                    if targetPortMatch.group(2) is not None:
+                        listenOnHadHost = (len(targetPortMatch.group(2)) > 0)
                 
                 # Don't print the line now, stash it for output once the TCP proxy
                 # has started:
