@@ -74,10 +74,6 @@ class ProxyDirection(Enum):
     """The proxy directionality."""
     FORWARD = 0
     REVERSE = 1
-    
-    @staticmethod
-    def as_str(enum_val):
-        return {ProxyDirection.FORWARD: 'forward', ProxyDirection.REVERSE: 'reverse'}[enum_val]
 
 
 class VSCodeProxyConfig(argparse.Namespace):

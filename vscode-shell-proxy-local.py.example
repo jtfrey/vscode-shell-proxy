@@ -32,9 +32,9 @@ class VSCodeTCPProxyUD(VSCodeTCPProxy):
     def notify_did_complete_io_streams(self):
         log_warn('All i/o streams closed')
     def notify_did_read_io_stream_data(self, direction: ProxyDirection, data: bytes):
-        log_warn('%s proxy read %d bytes', ProxyDirection.as_str(direction), len(data))
+        log_warn('%s proxy read %d bytes', direction.name, len(data))
     def notify_did_write_io_stream_data(self, direction: ProxyDirection, data: bytes):
-        log_warn('%s proxy wrote %d bytes', ProxyDirection.as_str(direction), len(data))
+        log_warn('%s proxy wrote %d bytes', direction.name, len(data))
 
 VSCodeTCPProxyClass = VSCodeTCPProxyUD
 
