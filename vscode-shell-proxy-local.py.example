@@ -1,0 +1,40 @@
+
+class VSCodeProxyConfigUD(VSCodeProxyConfig):
+
+    DEFAULT_VERBOSITY: int = 3
+
+    @classmethod
+    def cli_parser(cls):
+        cli_parser = VSCodeProxyConfig.cli_parser()
+        cli_parser.add_argument('-g', '--group', '--workgroup', metavar='<WORKGROUP>',
+            dest='workgroup',
+            default=None,
+            help='the workgroup used to submit the vscode job')
+        return cli_parser
+
+VSCodeProxyConfigClass = VSCodeProxyConfigUD
+
+
+class VSCodeTCPProxyUD(VSCodeTCPProxy):
+
+    def notify_will_listen(self):
+        log_warn('This is the will_listen callback')
+    def notify_is_listening(self):
+        log_warn('This is the is_listening callback')
+    def notify_did_client_connect(self, client_host: str, client_port: int):
+        log_warn('Client connected: %s:%d', client_host, client_port)
+    def notify_will_connect_backend(self, backend_host: str, backend_port: int):
+        log_warn('Will connect to %s:%d', backend_host, backend_port)
+    def notify_did_connect_backend(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        log_warn('Connected to backend')
+    def notify_did_launch_io_streams(self, fwd_task, rev_task):
+        log_warn('Launched i/o streams')
+    def notify_did_complete_io_streams(self):
+        log_warn('All i/o streams closed')
+    def notify_did_read_io_stream_data(self, direction: ProxyDirection, data: bytes):
+        log_warn('%s proxy read %d bytes', ProxyDirection.as_str(direction), len(data))
+    def notify_did_write_io_stream_data(self, direction: ProxyDirection, data: bytes):
+        log_warn('%s proxy wrote %d bytes', ProxyDirection.as_str(direction), len(data))
+
+VSCodeTCPProxyClass = VSCodeTCPProxyUD
+

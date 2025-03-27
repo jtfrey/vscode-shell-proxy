@@ -18,441 +18,447 @@
 # them to the actual TCP listener on the compute node.
 #
 
-import asyncio
-import time
 import logging
-import threading
 import argparse
-import subprocess
-import re
+import threading
 import sys
 import os
+import ast
 from enum import Enum
 
-# This is the local TCP port on which this script is listening:
-proxyPort = None
+#
+# The following are used for type-checking throughout the code; some of the
+# types are handled differently across 3.x versions.
+#
+from typing import TYPE_CHECKING, Any, TextIO
+EllipsisType = Any
+if sys.version_info >= (3, 9):
+    from collections.abc import Iterable
+    from builtins import list as List
+    from builtins import tuple as Tuple
+    if sys.version_info >= (3, 10):
+        from types import EllipsisType
+else:
+    from typing import List, Tuple, Iterable
 
-# This is the remote (compute node) hostname and TCP port on which vscode backend
-# is listening:
-targetHost = None
-targetPort = None
+#
+# Abstract-out some functions that creates an async task and execute
+# it to account for API differences from 3.7 onward:
+#
+import asyncio
+if sys.version_info >= (3, 7):
+    asyncio_create_task = asyncio.create_task
+    asyncio_run = asyncio.run
+else:
+    asyncio_create_task = asyncio.ensure_future
+    def asyncio_run(coro):
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            raise RuntimeError("Event loop is already running")
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
-# Regex for the line output by the vscode backend indicating the TCP port on which
-# it is listening:
-targetPortRegex = re.compile(r'^([^0-9]*listeningOn=[^0-9]*)(([0-9][0-9]*\.){3}[0-9][0-9]*:)?([0-9][0-9]*)([^0-9]*)$')
 
-# Regex for input lines containing references to running servers bound to the
-# localhost interface only:
-localhostFixupNodeJSRegex = re.compile(r'((\$args =.*)|(\$VSCH_SERVER_SCRIPT.*))--host=127.0.0.1')
-localhostFixupCLIListenArgsRegex = re.compile(r'(LISTEN_ARGS=".*)(--on-host=(([0-9][0-9]*\.){3}[0-9][0-9]*))')
-localhostFixupCLICmdRegex = re.compile(r'(VSCODE_CLI_REQUIRE_TOKEN=[0-9a-fA-F-]*.*\$CLI_PATH.*command-shell )(.*)(--on-host=(([0-9][0-9]*\.){3}[0-9][0-9]*))')
-
-# Any commands this script itself sends to the remote shell should have their output
-# prefixed with this text to indicate they are NOT in response to VSCode application
-# commands:
-ourShellOutputPrefix = 'VSCODE_SHELL_PROXY::::'
-
-# Default buffer size for binary TCP proxy i/o:
-DEFAULT_BYTE_LIMIT = 4096
-
-# Default connection acceptance backlog count:
-DEFAULT_BACKLOG = 8
-
-# The script progresses through these states:
 class ProxyStates(Enum):
+    """The states that the proxy moves through as the proxy executes."""
     LAUNCH = 0
     BEGIN = 1
     START_PROXY = 2
     PROXY_STARTED = 3
     END = 4
 
-# This condition will be used to synchronize the progression of the script through
-# operational states:
-proxyStateCond = threading.Condition()
-proxyState = ProxyStates.LAUNCH
-def checkProxyState(desiredState):
-    global proxyState
-    return proxyState == desiredState
 
-
-async def tcp_proxy_xfer(R, W):
-    """Receive data from a reader and send it on a writer, closing and exiting from this function on any errors, end-of-file, etc."""
-    global cliArgs
+class ProxyDirection(Enum):
+    """The proxy directionality."""
+    FORWARD = 0
+    REVERSE = 1
     
-    while not R.at_eof() and not W.is_closing():
-        binaryData = await R.read(cliArgs.byteLimit)
-        if binaryData:
-            # Send the data on the writer:
-            W.write(binaryData)
-            await W.drain()
+    @staticmethod
+    def as_str(enum_val):
+        return {ProxyDirection.FORWARD: 'forward', ProxyDirection.REVERSE: 'reverse'}[enum_val]
+
+
+class VSCodeProxyConfig(argparse.Namespace):
+    """The VSCodeProxyConfig class is designed to include all configurable/modifiable attributes of this program.  It represents the baseline functionality and site-specific modifications can be implemented by subclassing in a script file adjacent to this script on the file system.
+
+Subclasses should:
+
+- Overload the cli_parser() class method to chain to the parent class's method and augment the returned argparse object before returning it to the caller.
+- Overload the set_defaults() instance method to chain to the parent class's method and provide default values to its own instance variables.
+"""
+
+    SHELL_OUTPUT_PREFIX: str = 'VSCODE_SHELL_PROXY::::'
+    LOGGING_LEVELS: List[int] = [ logging.CRITICAL,
+                       logging.ERROR,
+                       logging.WARNING,
+                       logging.INFO,
+                       logging.DEBUG ]
+    BASE_LOGGING_LEVEL: int = 1 # logging.ERROR
+
+    DEFAULT_VERBOSITY: int = 0
+    DEFAULT_QUIETNESS: int = 0
+    DEFAULT_LISTEN_PORT: int = 0
+    DEFAULT_LISTEN_HOST: str = '127.0.0.1'
+    DEFAULT_CONN_BACKLOG: int = 8
+    DEFAULT_READ_BYTE_LIMIT: int = 4096
+    
+    @classmethod
+    def cli_parser(cls):
+        """The cli_parser() class method creates and returns an argparse instance that can parse command-line arguments for the proxy.  Site-specific extensions can be added by subclassing VSCodeProxyConfig and supplying a cli_parser() class method that chains to its parent class's method and uses add_argument() to augment the parser returned by the parent method."""
+        cli_parser = argparse.ArgumentParser(description='vscode remote shell proxy')
+        cli_parser.add_argument('-v', '--verbose',
+                dest='verbosity',
+                default=cls.DEFAULT_VERBOSITY,
+                action='count',
+                help='increase the level of output as the program executes')
+        cli_parser.add_argument('-q', '--quiet',
+                dest='quietness',
+                default=cls.DEFAULT_QUIETNESS,
+                action='count',
+                help='decrease the level of output as the program executes')
+        cli_parser.add_argument('-l', '--log-file', metavar='<PATH>',
+                dest='log_file',
+                default=None,
+                help='direct all logging to this file rather than stderr; the token "[PID]" will be replaced with the running pid')
+        cli_parser.add_argument('-0', '--tee-stdin', metavar='<PATH>',
+                dest='tee_stdin_file',
+                default=None,
+                help='send a copy of input to the script stdin to this file; the token "[PID]" will be replaced with the running pid')
+        cli_parser.add_argument('-1', '--tee-stdout', metavar='<PATH>',
+                dest='tee_stdout_file',
+                default=None,
+                help='send a copy of output to the script stdout to this file; the token "[PID]" will be replaced with the running pid')
+        cli_parser.add_argument('-2', '--tee-stderr', metavar='<PATH>',
+                dest='tee_stderr_file',
+                default=None,
+                help='send a copy of output to the script stderr to this file; the token "[PID]" will be replaced with the running pid')
+        cli_parser.add_argument('-b', '--backlog', metavar='<N>',
+                dest='conn_backlog',
+                default=cls.DEFAULT_CONN_BACKLOG,
+                type=int,
+                help='number of backlogged connections held by the proxy socket (see man page for listen(), default {:d})'.format(cls.DEFAULT_CONN_BACKLOG))
+        cli_parser.add_argument('-B', '--byte-limit', metavar='<N>',
+                dest='read_byte_limit',
+                default=cls.DEFAULT_READ_BYTE_LIMIT,
+                type=int,
+                help='maximum bytes read at one time per socket (default {:d})'.format(cls.DEFAULT_READ_BYTE_LIMIT))
+        cli_parser.add_argument('-H', '--listen-host', metavar='<HOSTNAME>',
+                dest='listen_host',
+                default=cls.DEFAULT_LISTEN_HOST,
+                help='the client-facing TCP proxy should bind to this interface (default {:s}; use 0.0.0.0 for all interfaces)'.format(cls.DEFAULT_LISTEN_HOST))
+        cli_parser.add_argument('-p', '--listen-port', metavar='<N>',
+                dest='listen_port',
+                default=cls.DEFAULT_LISTEN_PORT,
+                type=int,
+                help='the client-facing TCP proxy port (default {:d})'.format(cls.DEFAULT_LISTEN_PORT))
+        cli_parser.add_argument('-S', '--salloc-arg', metavar='<SLURM-ARG>',
+                dest='salloc_args',
+                action='append',
+                help='used zero or more times to specify arguments to the salloc command being wrapped (e.g. --partition=<name>, --ntasks=<N>)')
+        return cli_parser
+    
+    @classmethod
+    def create_with_cli_args(cls):
+        """The create_with_cli_args() class method creates and returns an instance initialized with command-line arguments provided by the argparse parser returned by the cli_parser() class method.  Subclasses may provide their own cli_parser() and set_defaults() methods, but this one should not require replacement."""
+        cli_parser = cls.cli_parser()
+        cli_args = cli_parser.parse_args()
+        return cls(**cli_args.__dict__)
+
+    def __init__(self, **kwargs):
+        """Initialize an instance of the class with default values augmented by keyword arguments (possibly coming from an argparse call)."""
+        self.set_defaults()
+        print(self.verbosity)
+        # Allow CLI arguments to override defaults:
+        super(VSCodeProxyConfig, self).__init__(**kwargs)
+        print(self.verbosity)
+    
+    def set_defaults(self):
+        """Supply default values to instance variables in the receiver."""
+        self.shell_output_prefix: str = self.__class__.SHELL_OUTPUT_PREFIX
+        self.verbosity: int = self.__class__.DEFAULT_VERBOSITY
+        self.quietness: int = self.__class__.DEFAULT_QUIETNESS
+        self.log_file: 'str|None' = None
+        self.tee_stdin_file: 'str|None' = None
+        self.tee_stdout_file: 'str|None' = None
+        self.tee_stderr_file: 'str|None' = None
+        self.conn_backlog: int = self.__class__.DEFAULT_CONN_BACKLOG
+        self.read_byte_limit: int = self.__class__.DEFAULT_READ_BYTE_LIMIT
+        self.listen_port: int = self.__class__.DEFAULT_LISTEN_PORT
+        self.listen_host: str = self.__class__.DEFAULT_LISTEN_HOST
+        self.salloc_args: 'Iterable[str]|None' = None
+    
+    def init_logging(self):
+        """Given the parameters associated with the receiver, initialize the default Python logger facility.  Returns self so that this method can be chained with others."""
+        # Calculate the desired logging level...
+        chosen_logging_level = self.__class__.BASE_LOGGING_LEVEL + self.verbosity - self.quietness
+        # ...and limit to our range of levels:
+        chosen_logging_level = min(max(0, chosen_logging_level), len(self.__class__.LOGGING_LEVELS)-1)
+        if self.log_file:
+            # Replace tokens in the log file name:
+            self.log_file = self.log_file.replace('[PID]', str(os.getpid()))
+        # Configure the logging class:
+        logging.basicConfig(filename=self.log_file,
+                            level=self.__class__.LOGGING_LEVELS[chosen_logging_level],
+                            format='%(asctime)s [%(levelname)s] %(message)s')
+        return self
+    
+#
+# Logging helpers:
+#
+def log_crit(msg, *vals):
+    logging.critical(msg, *(v.strip() if isinstance(v, str) else v for v in vals))
+def log_err(msg, *vals):
+    logging.error(msg, *(v.strip() if isinstance(v, str) else v for v in vals))
+def log_warn(msg, *vals):
+    logging.warning(msg, *(v.strip() if isinstance(v, str) else v for v in vals))
+def log_info(msg, *vals):
+    logging.info(msg, *(v.strip() if isinstance(v, str) else v for v in vals))
+def log_debug(msg, *vals):
+    logging.debug(msg, *(v.strip() if isinstance(v, str) else v for v in vals))
+        
+# Set the default configuration class — a local proxy config script can alter this:
+VSCodeProxyConfigClass = VSCodeProxyConfig
+
+
+
+class VSCodeTCPProxy(object):
+    """An instance of VSCodeTCPProxy forms the bridge between a local TCP port and the TCP listening port opened by the remote vscode extension on a compute node.
+
+The instance listens on TCP <host>:<port> indicated by the VSCodeProxyConfig object passed to it.  In practice, the VSCode software on a client's computer will attempt to connect to <cfg.listen_host>:<cfg.listen_port> to establish and reestablish communications with the backend.  This class accepts that connection, opens a connection to the <backend_host>:<backend_port> on the compute node (on which the extension is backend), and then passes traffic back and forth between the two endpoints.
+"""
+
+    def __init__(self, cfg: VSCodeProxyConfig, runloop: 'asyncio.AbstractEventLoop|None'=None):
+        # Retain a reference to the configuration:
+        self._cfg = cfg
+        
+        # This is the remote (compute node) host id and TCP port on which vscode backend is listening:
+        self.backend_host: "str|None" = None
+        self.backend_port: "int|None" = None
+        
+        # State of the proxy:
+        self.state: ProxyStates = ProxyStates.LAUNCH
+        
+        # Synchronize state changes between the proxy thread and the rest of the code using a
+        # Condition object:
+        self._state_condition = threading.Condition()
+        
+        # Use the existing runloop OR create a new one if none was provided:
+        self._runloop: asyncio.AbstractEventLoop = runloop if runloop is not None else asyncio.new_event_loop()
+        
+        # Create a separate thread in which the proxy i/o will happen:
+        self._thread = threading.Thread(
+            name='vscode-tcp-proxy',
+            target=self._start_tcp_proxy,
+            args=(self._runloop,),
+            daemon=True)
+
+    def start(self):
+        """Start the i/o thread associated with this proxy.  Returns self so that methods can be chained."""
+        self.set_state(ProxyStates.BEGIN, msg='main runloop')
+        self._thread.start()
+        return self
+
+    async def stop(self):
+        """Attempt to stop the i/o thread associated with this proxy.  Returns self so that methods can be chained."""
+        log_debug('Terminating TCP proxy event loop...')
+        await self._runloop.shutdown_asyncgens()
+        self._runloop.stop()
+        log_debug('Proxy has terminated.')
+        return self
+
+    def set_state(self, state: ProxyStates, msg: str):
+        """Change the state of the TCP proxy.  Returns self so that methods can be chained."""
+        with self._state_condition:
+            self.state = state
+            log_debug(f'[STATE] {state} <- {msg}')
+            self._state_condition.notify_all()
+        return self
+
+    def wait_for(self, state: ProxyStates, msg: str):
+        """Wait for the TCP proxy to reach the given state.  Returns self so that methods can be chained."""
+        with self._state_condition:
+            log_debug(msg)
+            self._state_condition.wait_for(lambda: self.state == state)
+        return self
+
+    @property
+    def target_addr(self) -> 'Tuple[str, int] | None':
+        if self.backend_host is None or self.backend_port is None:
+            return None
         else:
-            # No data implies the reader has closed:
-            W.close()
-            break
+            return (self.backend_host, self.backend_port)
 
-
-async def tcp_proxy_connect(sR, sW):
-    """Accept a connection opened on the proxy port.  Open a connection to the vscode backend then create two async transfer functions to forward data between them."""
-    sWAddr = sW.get_extra_info('peername')
-    logging.info('{:s}:{:d} connection accepted'.format(*sWAddr))
-    try:
-        rR, rW = await asyncio.open_connection(targetHost, targetPort)
-        async with asyncio.TaskGroup() as tg:
-            t1 = tg.create_task(tcp_proxy_xfer(sR, rW))
-            t2 = tg.create_task(tcp_proxy_xfer(rR, sW))
-            logging.debug('{:s}:{:d} i/o tasks scheduled'.format(*sWAddr))
-        logging.debug('{:s}:{:d} i/o tasks completed'.format(*sWAddr))
-    except Exception as E:
-        logging.error('{:s}:{:d} failure: {:s}'.format(sWAddr[0], sWAddr[1], str(E)))
-        sW.close()
-
-
-async def tcp_proxy():
-    global proxyPort, proxyState, proxyStateCond, cliArgs
-    """The vscode backend TCP port proxy server."""
-    with proxyStateCond:
-        logging.debug('    Waiting on TCP proxy server start condition...')
-        proxyStateCond.wait_for(lambda:checkProxyState(ProxyStates.START_PROXY))
-        logging.debug('    Starting TCP proxy server on port %d', cliArgs.listenPort)
-        server = await asyncio.start_server(tcp_proxy_connect, cliArgs.listenHost, cliArgs.listenPort, reuse_port=True, backlog=cliArgs.backlog)
-        # Get the port we're listening on:
-        proxyPort = server.sockets[0].getsockname()[1]
-        
-        logging.info('    Running TCP proxy server on port %d...', proxyPort)
-        proxyState = ProxyStates.PROXY_STARTED
-        logging.debug('[STATE] PROXY_STARTED <- TCP proxy runloop')
-        proxyStateCond.notify_all()
-    async with server:
-        await server.serve_forever()
-    logging.debug('    Terminating TCP proxy server.')
-
-
-def start_tcp_proxy(loop):
-    """Alternative thread that will run the vscode backend TCP port proxy runloop."""
-    asyncio.set_event_loop(loop)
-    logging.debug('  Entering tcp proxy event loop')
-    loop.run_until_complete(tcp_proxy())
-    logging.debug('  Exited tcp proxy event loop')
-
-
-def stdinProxyThread(drain, copyToFile=None):
-    """Target function for a thread that will consume input from this script's stdin and write it to the remote shell's stdin.  Before any forwarding begins, introspective command(s) associated with this script are sent (and their output will be consumed by the stdout-forwarding thread).  When EOF is reached on this script's stdin the state is forwarded to END, yielding the shutdown of this script -- the connection from the VSCode application has been severed."""
-    global proxyStateCond, proxyState, localhostFixupNodeJSRegex, localhostFixupCLICmdRegex
-    global localhostFixupCLIListenArgsRegex
-
-    hasCLIListenArgs = False
+    def __repr__(self):
+        return (
+            f'<{type(self).__name__}'
+            f' state={self.state!r}'
+            f' listen={self._cfg.listen_host}:{self._cfg.listen_port}'
+            f' target={self.backend_host}:{self.backend_port}'
+            '>'
+        )
     
-    # Start by sending our special `hostname` command:
-    hostnameCmd = 'echo "{:s}HOSTNAME=$(hostname)"\n'.format(ourShellOutputPrefix)
-    if copyToFile:
-        copyToFile.write(hostnameCmd); copyToFile.flush()
-    drain.write(hostnameCmd); drain.flush()
-    logging.debug('Wrote startup command to remote shell: %s', hostnameCmd.strip())
+    def _start_tcp_proxy(self, runloop: asyncio.AbstractEventLoop):
+        """Thread entrypoint that will handle the backend TCP proxy."""
+        asyncio.set_event_loop(runloop)
+        
+        log_debug('  Entering backend TCP proxy event loop',)
+        runloop.run_until_complete(self._tcp_proxy_listen())
+        log_debug('  Exited backend TCP proxy event loop',)
     
-    while True:
-        logging.debug('Waiting on stdin...')
-        inputLine = sys.stdin.readline()
-        if not inputLine:
-            break
-        
-        # Localhost fixups?
-        if '--host=127.0.0.1' in inputLine:
-            # Confirm it's one of the lines we're expecting:
-            localhostFixupMatch = localhostFixupNodeJSRegex.search(inputLine)
-            if localhostFixupMatch is None:
-                logging.warning('unanticipated localhost line found: %s', inputLine.strip())
-            else:
-                logging.debug('localhost line found and fixed: %s', inputLine.strip())
-                inputLine = inputLine.replace('127.0.0.1', '0.0.0.0')
-        elif not hasCLIListenArgs and '"$CLI_PATH" command-shell' in inputLine:
-            # Confirm it's one of the lines we're expecting:
-            localhostFixupMatch = localhostFixupCLICmdRegex.search(inputLine)
-            if localhostFixupMatch is None:
-                logging.warning('unanticipated localhost line found: %s', inputLine.strip())
-            else:
-                logging.debug('localhost line found and fixed: %s', inputLine.strip())
-                inputLine = re.sub(localhostFixupCLICmdRegex, r'\g<1> --on-host=0.0.0.0 \g<2>', inputLine)
-        elif 'LISTEN_ARGS=' in inputLine:
-            # Confirm it's the line we're expecting:
-            localhostFixupMatch = localhostFixupCLIListenArgsRegex.search(inputLine)
-            if ( localhostFixupMatch is None ):
-                logging.warning('unanticipated localhost line found: %s', inputLine.strip())
-            else:
-                logging.debug('localhost line found and fixed: %s', inputLine.strip())
-                inputLine = re.sub(localhostFixupCLIListenArgsRegex, r'\g<1> --on-host=0.0.0.0 ', inputLine)
-                hasCLIListenArgs = True
-        
-        if copyToFile is not None:
-            copyToFile.write(inputLine); copyToFile.flush()
-        drain.write(inputLine); drain.flush()
-
-    # All done, let everyone know:
-    with proxyStateCond:
-        proxyState = ProxyStates.END
-        logging.debug('[STATE] END <- stdin thread')
-        proxyStateCond.notify_all()
-
-
-def stderrProxyThread(faucet, copyToFile=None):
-    """Consume output to the remote shell's stderr and write it to this script's stderr."""
-    if copyToFile is not None:
-        while True:
-            logging.debug('Waiting on remote stderr...')
-            inputLine = faucet.readline()
-            if not inputLine:
-                break
-            copyToFile.write(inputLine); copyToFile.flush()
-            sys.stderr.write(inputLine); sys.stderr.flush()
-    else:
-        while True:
-            inputLine = faucet.readline()
-            if not inputLine:
-                break
-            sys.stderr.write(inputLine); sys.stderr.flush()
-
-
-def stdoutProxyThread(faucet, copyToFile=None):
-    """Consume output to the remote shell's stdout and write it to this script's stdout.  This function is far more complex compared to the stderrProxyThread() function:  the stdout lines must be scanned for output associated with commands issued by this script (e.g. to get the remote hostname) and the remote TCP port on which the vscode backend is listening.  Once those data are known, this script's TCP proxy can be started.  When EOF is reached on the remote shell's stdout the state is forwarded to END, yielding the shutdown of this script -- the connection to the remote shell has been severed."""
-    global targetHost, targetPort, targetPortRegex, proxyStateCond, proxyState
-    
-    listenOnHadHost = False
-    
-    while True:
-        logging.debug('Waiting on remote stdout...')
-        outputLine = faucet.readline()
-        if not outputLine:
-            break
-        
-        omitLine = False
-        
-        # Is it one of our command(s)?
-        if outputLine.startswith(ourShellOutputPrefix):
-            # Drop the prefix:
-            outputLine = outputLine[len(ourShellOutputPrefix):]
+    async def _tcp_proxy_listen(self):
+        """Once the backend TCP host:port are known, listen for connections from the client's computer to start proxying communications."""
+        with self._state_condition:
+            log_debug('    Waiting on backend TCP proxy server start condition...')
+            self._state_condition.wait_for(lambda: self.state == ProxyStates.START_PROXY)
             
-            # Is it the hostname line?
-            if outputLine.startswith('HOSTNAME='):
-                targetHost = outputLine[len('HOSTNAME='):].strip()
-                logging.info('Remote hostname found:  %s', targetHost)
+            self.notify_will_listen()
+
+            log_info('    Starting backend TCP proxy server on port %d', self._cfg.listen_port)
+            server = await asyncio.start_server(
+                self._tcp_proxy_connect,
+                self._cfg.listen_host,
+                self._cfg.listen_port,
+                reuse_port=True,
+                backlog=self._cfg.conn_backlog)
+
+            # "Publish" the TCP port on which we're listening:
+            self.actual_listen_port = server.sockets[0].getsockname()[1]
+            log_info('    Running backend TCP proxy server on port %d...', self.actual_listen_port)
             
-            # Never send these lines to the app:
-            omitLine = True
-        else:
-            # Output coming back from the remote vscode stuff:
-            if targetPort is None and 'listeningOn=' in outputLine:
-                logging.debug('Remote vscode TCP listener port found: %s', outputLine.strip())
-                targetPortMatch = targetPortRegex.search(outputLine)
-                if targetPortMatch is not None:
-                    targetPort = int(targetPortMatch.group(4))
-                    logging.info('Remote TCP port found:  %d', targetPort)
-                    if targetPortMatch.group(2) is not None:
-                        listenOnHadHost = (len(targetPortMatch.group(2)) > 0)
+            self.notify_is_listening()
+            
+            self.state = ProxyStates.PROXY_STARTED
+
+            log_debug('[STATE] PROXY_STARTED <- TCP proxy runloop')
+            self._state_condition.notify_all()
+        async with server:
+            await server.serve_forever()
+        log_debug('    Terminating backend TCP proxy server.')
+    
+    def notify_will_listen(self):
+        """A callback that can be implemented by subclasses to execute code before the proxy begins listening for connections."""
+        pass
+    def notify_is_listening(self):
+        """A callback that can be implemented by subclasses to execute code after the proxy is listening for connections.  The state has not transitioned to PROXY_STARTED yet."""
+        pass
+
+    async def _tcp_proxy_connect(self, src_reader: asyncio.StreamReader, src_writer: asyncio.StreamWriter):
+        """Accept a connection opened on the proxy port, open a connection to the backend on the compute node, then create two async transfer functions to forward data between them."""
+        target_addr = src_writer.get_extra_info("peername")
+        log_info('%s:%d connection accepted', *target_addr)
+        self.notify_did_client_connect(*target_addr)
+
+        if self.backend_host is None:
+            raise RuntimeError('Backend TCP host is not set')
+        if self.backend_port is None:
+            raise RuntimeError('Backend TCP port is not set')
+
+        try:
+            self.notify_will_connect_backend(self.backend_host, self.backend_port)
+            dst_reader, dst_writer = await asyncio.open_connection(self.backend_host, self.backend_port)
+            self.notify_did_connect_backend(dst_reader, dst_writer)
+            
+            t_fwd = asyncio_create_task(self._tcp_proxy_transfer(ProxyDirection.FORWARD, src_reader, dst_writer))
+            t_rev = asyncio_create_task(self._tcp_proxy_transfer(ProxyDirection.REVERSE, dst_reader, src_writer))
+            self.notify_did_launch_io_streams(t_fwd, t_rev)
+            log_debug('%s:%d i/o tasks scheduled', *target_addr)
+            await asyncio.gather(t_fwd, t_rev)
+            self.notify_did_complete_io_streams()
+            log_debug('%s:%d i/o tasks completed', *target_addr)
+        except Exception as err:
+            log_err('%s:%d failure: %s', *target_addr, str(err))
+            src_writer.close()
+    
+    def notify_did_client_connect(self, client_host: str, client_port: int):
+        """A callback that can be implemented by subclasses to execute code after a client has connected to the TCP proxy."""
+        pass
+    def notify_will_connect_backend(self, backend_host: str, backend_port: int):
+        """A callback that can be implemented by subclasses to execute code before the proxy connects to the backend."""
+        pass
+    def notify_did_connect_backend(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """A callback that can be implemented by subclasses to execute code after the proxy has connected to the backend but before the i/o streams have been established."""
+        pass
+    def notify_did_launch_io_streams(self, fwd_task, rev_task):
+        """A callback that can be implemented by subclasses to execute code after the backend i/o streams have been established."""
+        pass
+    def notify_did_complete_io_streams(self):
+        """A callback that can be implemented by subclasses to execute code after the backend i/o streams have closed."""
+        pass
+
+    async def _tcp_proxy_transfer(self, direction: ProxyDirection, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Receive data from a reader and send it on a writer,
+        closing and exiting from this function on any errors, end-of-file, etc."""
+        while not reader.at_eof() and not writer.is_closing():
+            data = await reader.read(self._cfg.read_byte_limit)
+            if data:
+                self.notify_did_read_io_stream_data(direction, data)
                 
-                # Don't print the line now, stash it for output once the TCP proxy
-                # has started:
-                omitLine = True
-                targetPortLine = outputLine
-
-        if proxyState is ProxyStates.BEGIN and targetHost is not None and targetPort is not None:        
-            # Before going any further, start the proxy:
-            with proxyStateCond:
-                proxyState = ProxyStates.START_PROXY
-                logging.debug('[STATE] START_PROXY <- stdout thread')
-                proxyStateCond.notify_all()
-
-            # Once it's started we can continue:
-            with proxyStateCond:
-                logging.debug('stdout thread waiting for TCP proxy startup completed...')
-                proxyStateCond.wait_for(lambda:checkProxyState(ProxyStates.PROXY_STARTED))
-    
-            # Reformat the line with the local listening port:
-            targetHostStr = '127.0.0.1:' if listenOnHadHost else ''
-            targetPortLine = re.sub(targetPortRegex, r'\g<1>{:s}{:d}\g<5>'.format(targetHostStr, proxyPort), targetPortLine)
-            logging.debug('Remote vscode TCP listener line rewritten: %s', targetPortLine.strip())
+                # Send the data on the writer:
+                writer.write(data)
+                await writer.drain()
+                self.notify_did_write_io_stream_data(direction, data)
+            else:
+                # No data implies the reader has closed:
+                writer.close()
+                break
+    def notify_did_read_io_stream_data(self, direction: ProxyDirection, data: bytes):
+        """A callback that can be implemented by subclasses to execute code after a backend i/o stream has read data."""
+        pass
+    def notify_did_write_io_stream_data(self, direction: ProxyDirection, data: bytes):
+        """A callback that can be implemented by subclasses to execute code after a backend i/o stream has written data."""
+        pass
         
-            if copyToFile:
-                copyToFile.write(targetPortLine); copyToFile.flush()
-            sys.stdout.write(targetPortLine)
-
-        if not omitLine:
-            if copyToFile:
-                copyToFile.write(outputLine); copyToFile.flush()
-            sys.stdout.write(outputLine)
-        
-        sys.stdout.flush()
-
-    # All done, let everyone know:
-    with proxyStateCond:
-        proxyState = ProxyStates.END
-        logging.debug('[STATE] END <- stdout thread')
-        proxyStateCond.notify_all()
+# Set the default TCP proxy class — a local proxy config script can alter this:
+VSCodeTCPProxyClass = VSCodeTCPProxy
 
 
-async def runloop():
-    """The main asyncio event loop for this script.  Starts the TCP port proxy so it will be awaiting a startup signal (once the remote hostname and TCP port are known).  Launches the remote shell with Slurm `salloc` and connects its stdio channels to threaded i/o handlers.  The function then goes to sleep until the program state reaches END, then cleans-up the remote shell subprocess and TCP proxy runloop before exiting."""
-    global proxyState, proxyStateCond, cliArgs, teeFiles
-    
-    logging.debug('Runloop start')
-    with proxyStateCond:
-        proxyState = ProxyStates.BEGIN
-        logging.debug('[STATE] BEGIN <- main runloop')
-        proxyStateCond.notify_all()
-    
-    # Get a separate thread setup for the TCP proxy:
-    proxyLoop = asyncio.new_event_loop()
-    proxyThread = threading.Thread(name='TCP-Proxy', target=start_tcp_proxy, args=(proxyLoop,), daemon=True)
-    proxyThread.start()
-    
-    # Start the remote shell:
-    remoteShellCmd = ['workgroup', '-g', cliArgs.workgroup, '--command', '@', '--', 'salloc' ]
-    if cliArgs.sallocArgs:
-        remoteShellCmd.extend(cliArgs.sallocArgs)
-    logging.debug('Command to launch remote shell: "%s"', ' '.join(remoteShellCmd))
-    remoteShellProc = subprocess.Popen(
-                                remoteShellCmd,
-                                stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                bufsize=1
-                            )
-    logging.info('Remote shell launched with pid %d', remoteShellProc.pid)
 
 
-    # Start the stdio threads:
-    stdinProxy = threading.Thread(
-                        name='Remote-Shell-Stdin',
-                        target=stdinProxyThread,
-                        args=(remoteShellProc.stdin, teeFiles['stdin']),
-                        daemon=True)
-    stderrProxy = threading.Thread(
-                        name='Remote-Shell-Stderr',
-                        target=stderrProxyThread,
-                        args=(remoteShellProc.stderr, teeFiles['stderr']),
-                        daemon=True)
-    stdoutProxy = threading.Thread(
-                        name='Remote-Shell-Stdout',
-                        target=stdoutProxyThread,
-                        args=(remoteShellProc.stdout, teeFiles['stdout']),
-                        daemon=True)
-    stdoutProxy.start()
-    stderrProxy.start()
-    stdinProxy.start()
-    with proxyStateCond:
-        logging.debug('Awaiting proxy termination...')
-        proxyStateCond.wait_for(lambda:checkProxyState(ProxyStates.END))
-    
-    # Terminate the remote shell:
-    logging.info('Terminating remote shell process...')
-    remoteShellProc.terminate()
+#
+# Check for a local config script adjacent to this script on the filesystem.
+# If present, then execute that script in this context.
+#
+local_cfg_script = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'vscode-shell-proxy-local.py')
+if os.path.isfile(local_cfg_script):
     try:
-        remoteShellProc.wait(timeout=10)
-    except:
-        remoteShellProc.kill()
-    
-    # Terminate the TCP proxy event loop:
-    logging.debug('Terminating TCP proxy event loop...')
-    await proxyLoop.shutdown_asyncgens()
-    proxyLoop.stop()
-    
-    # We don't bother joining the i/o threads, they're daemons anyway.
-    
-    logging.debug('Proxy has terminated.')
+        with open(local_cfg_script, 'r') as fptr:
+            local_cfg_src = fptr.read()
+    except Exception as err:
+        sys.stderr.write('ERROR:  unable to open local proxy config script for reading: {:s}\n'.format(str(err)))
+        sys.exit(-1)
+    try:
+        local_cfg_code = compile(local_cfg_src, local_cfg_script, 'exec')
+        exec(local_cfg_code)
+    except Exception as err:
+        import traceback
+        sys.stderr.write('ERROR:  unable to execute local proxy config script:  {:s}\n'.format(str(err)))
+        traceback.print_tb(err.__traceback__, file=sys.stderr)
+        sys.exit(-1)
+else:
+    local_cfg_script = ''
+
+#
+# Get started by generating the configuration for the proxy from defaults
+# and CLI arguments:
+#
+cfg = VSCodeProxyConfigClass.create_with_cli_args().init_logging()
+if local_cfg_script:
+    log_info('Local configuration script executed from file "%s"', local_cfg_script)
+log_debug('Config class is "%s"', cfg.__class__.__name__)
+log_debug('Config initialized as %s', cfg.__dict__)
 
 
 
 
-loggingLevels = [ logging.CRITICAL, logging.ERROR, logging.WARNING, logging.INFO, logging.DEBUG ]
-baseLoggingLevel = 1
-        
-cliParser = argparse.ArgumentParser(description='vscode remote shell proxy')
-cliParser.add_argument('-v', '--verbose',
-        dest='verbosity',
-        default=0,
-        action='count',
-        help='increase the level of output as the program executes')
-cliParser.add_argument('-q', '--quiet',
-        dest='quietness',
-        default=0,
-        action='count',
-        help='decrease the level of output as the program executes')
-cliParser.add_argument('-l', '--log-file', metavar='<PATH>',
-        dest='logFile',
-        default=None,
-        help='direct all logging to this file rather than stderr; the token "[PID]" will be replaced with the running pid')
-cliParser.add_argument('-0', '--tee-stdin', metavar='<PATH>',
-        dest='teeStdinFile',
-        default=None,
-        help='send a copy of input to the script stdin to this file; the token "[PID]" will be replaced with the running pid')
-cliParser.add_argument('-1', '--tee-stdout', metavar='<PATH>',
-        dest='teeStdoutFile',
-        default=None,
-        help='send a copy of output to the script stdout to this file; the token "[PID]" will be replaced with the running pid')
-cliParser.add_argument('-2', '--tee-stderr', metavar='<PATH>',
-        dest='teeStderrFile',
-        default=None,
-        help='send a copy of output to the script stderr to this file; the token "[PID]" will be replaced with the running pid')
-cliParser.add_argument('-b', '--backlog', metavar='<N>',
-        dest='backlog',
-        default=DEFAULT_BACKLOG,
-        type=int,
-        help='number of backlogged connections held by the proxy socket (see man page for listen(), default {:d})'.format(DEFAULT_BACKLOG))
-cliParser.add_argument('-B', '--byte-limit', metavar='<N>',
-        dest='byteLimit',
-        default=DEFAULT_BYTE_LIMIT,
-        type=int,
-        help='maximum bytes read at one time per socket (default {:d}'.format(DEFAULT_BYTE_LIMIT))
-cliParser.add_argument('-H', '--listen-host', metavar='<HOSTNAME>',
-        dest='listenHost',
-        default='127.0.0.1',
-        help='the client-facing TCP proxy should bind to this interface (default 127.0.0.1; use 0.0.0.0 for all interfaces)')
-cliParser.add_argument('-p', '--listen-port', metavar='<N>',
-        dest='listenPort',
-        default=0,
-        type=int,
-        help='the client-facing TCP proxy port (default 0 implies a random port is chosen)')
-cliParser.add_argument('-g', '--group', '--workgroup', metavar='<WORKGROUP>',
-        dest='workgroup',
-        default=None,
-        help='the workgroup used to submit the vscode job')
-cliParser.add_argument('-S', '--salloc-arg', metavar='<SLURM-ARG>',
-        dest='sallocArgs',
-        action='append',
-        help='used zero or more times to specify arguments to the salloc command being wrapped (e.g. --partition=<name>, --ntasks=<N>)')
 
-cliArgs = cliParser.parse_args()
+tcp_proxy = VSCodeTCPProxyClass(cfg).start()
+tcp_proxy.backend_host = '127.0.0.1'
+tcp_proxy.backend_port = 22
+print(tcp_proxy)
+tcp_proxy.set_state(ProxyStates.START_PROXY, msg='Backend started')
 
-# Figure the logging level:
-chosenLoggingLevel = min(max(0, baseLoggingLevel + cliArgs.verbosity - cliArgs.quietness), len(loggingLevels)-1)
-if cliArgs.logFile:
-    cliArgs.logFile = cliArgs.logFile.replace('[PID]', str(os.getpid()))
-logging.basicConfig(filename=cliArgs.logFile, level=loggingLevels[chosenLoggingLevel], format='%(asctime)s [%(levelname)s] %(message)s')
+from time import sleep
 
-# Get tee files opened:
-teeFiles = { 'stdin': None, 'stdout': None, 'stderr': None }
-if cliArgs.teeStdinFile:
-    teeFiles['stdin'] = open(cliArgs.teeStdinFile.replace('[PID]', str(os.getpid())), 'w')
-if cliArgs.teeStdoutFile:
-    teeFiles['stdout'] = open(cliArgs.teeStdoutFile.replace('[PID]', str(os.getpid())), 'w')
-if cliArgs.teeStderrFile:
-    teeFiles['stderr'] = open(cliArgs.teeStderrFile.replace('[PID]', str(os.getpid())), 'w')
-
-# If no workgroup was provided, find one for this user:
-if cliArgs.workgroup is None:
-    logging.debug('Looking-up a workgroup for the current user')
-    workgroupLookupProc = subprocess.Popen(['workgroup', '-q', 'workgroups'],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True
-                            )
-    (workgroupStdout, dummy) = workgroupLookupProc.communicate()
-    # Extract the left-most <gid> <gname> pair:
-    workgroupMatch = re.match(r'^\s*[0-9]+\s*(\S+)', workgroupStdout)
-    if workgroupMatch is None:
-        logging.critical('No workgroup provided and user appears to be a member of no workgroups')
-        exit(errno.EINVAL)
-    cliArgs.workgroup = workgroupMatch.group(1)
-    logging.info('Automatically selected workgroup %s', cliArgs.workgroup)
-
-# Run the proxy server:
-asyncio.run(runloop())
+sleep(3000)
