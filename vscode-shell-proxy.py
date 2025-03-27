@@ -24,13 +24,15 @@ import threading
 import sys
 import os
 import ast
+import subprocess
+import re
 from enum import Enum
 
 #
 # The following are used for type-checking throughout the code; some of the
 # types are handled differently across 3.x versions.
 #
-from typing import TYPE_CHECKING, Any, TextIO
+from typing import TYPE_CHECKING, Any, TextIO, BinaryIO
 EllipsisType = Any
 if sys.version_info >= (3, 9):
     from collections.abc import Iterable
@@ -59,6 +61,17 @@ else:
             return loop.run_until_complete(coro)
         finally:
             loop.close()
+
+#
+# Define a version-agnostic string prefix removal function:
+#
+if sys.version_info >= (3, 9):
+    str_removeprefix = str.removeprefix
+else:
+    def str_removeprefix(__string: str, __prefix: str):
+        if __string.startswith(__prefix):
+            return __string[len(__prefix) :]
+        return __string
 
 
 class ProxyStates(Enum):
@@ -99,6 +112,10 @@ Subclasses should:
     DEFAULT_LISTEN_HOST: str = '127.0.0.1'
     DEFAULT_CONN_BACKLOG: int = 8
     DEFAULT_READ_BYTE_LIMIT: int = 4096
+    
+    DEFAULT_SUBPROCESS_WAIT_TIMEOUT: int = 10
+    
+    SCHEDULER_NAME: str = 'local-shell'
     
     @staticmethod
     def load_local_script(global_ns=None, local_ns=None) -> 'str|None':
@@ -172,10 +189,10 @@ Subclasses should:
                 default=cls.DEFAULT_LISTEN_PORT,
                 type=int,
                 help='the client-facing TCP proxy port (default {:d}; 0 => random port)'.format(cls.DEFAULT_LISTEN_PORT))
-        cli_parser.add_argument('-S', '--salloc-arg', metavar='<SLURM-ARG>',
-                dest='salloc_args',
+        cli_parser.add_argument('-S', '--{:s}-arg'.format(cls.SCHEDULER_NAME), metavar='<{:s}-ARG>'.format(cls.SCHEDULER_NAME.upper()),
+                dest='scheduler_args',
                 action='append',
-                help='used zero or more times to specify arguments to the salloc command being wrapped (e.g. --partition=<name>, --ntasks=<N>)')
+                help='used zero or more times to specify arguments to the {:s} command that launches the backend'.format(cls.SCHEDULER_NAME))
         return cli_parser
     
     @classmethod
@@ -301,7 +318,7 @@ The instance listens on TCP <host>:<port> indicated by the VSCodeProxyConfig obj
         return self
 
     @property
-    def target_addr(self) -> 'Tuple[str, int] | None':
+    def backend_addr(self) -> 'Tuple[str, int] | None':
         if self.backend_host is None or self.backend_port is None:
             return None
         else:
@@ -432,6 +449,351 @@ VSCodeTCPProxyClass = VSCodeTCPProxy
 
 
 
+class VSCodeBackendLauncher(object):
+    """Execute the vscode backend (likely on a compute node) and capture that process's stdin/stdout/stderr streams.  The stdout stream is monitored to extract the backend's TCP port for the sake of the binary TCP proxy."""
+    
+    def __init__(self, cfg: VSCodeProxyConfig):
+        # Retain a reference to the configuration:
+        self._cfg = cfg
+        
+        # Initialize instance variables:
+        self._proxy_threads: 'List[threading.Thread]' = []
+    
+    def job_scheduler_base_cmd(self):
+        """Return the baseline command array that is used to interactively start the vscode backend.  By default, the `bash` command is returned, which would start a local shell in which the vscode backend starts.
+
+Subclasses should override this method to return site-specific mechanisms.  For example, Slurm `salloc` with some standard options might return ['salloc', '--ntasks=1', '--partition=bigmem'].  Or for PBS, an interactive job would use ['qsub', '-I'].
+"""
+        return ['bash']
+        
+    def get_job_scheduler_cmd(self) -> List[str]:
+        """Augments the baseline command with additional arguments provided by the config object."""
+        cmd = self.job_scheduler_base_cmd()
+        addl_args = self._cfg.scheduler_args
+        if addl_args:
+            cmd.extend(addl_args)
+        return cmd
+        
+    def get_job_env(self) -> dict:
+        """Returns a dictionary containing the key-value pairs that should be present in the backend subprocess's environment."""
+        return { **os.environ }
+
+    def start(self, proxy: VSCodeTCPProxy):
+        """Start the backend process and plumb its i/o proxy threads.  Returns self so that methods can be chained."""
+        if '_job_proc' in self.__dict__:
+            log_crit('Attempt to start job submission wrapper multiple times')
+            sys.exit(-1)
+        job_cmd = self.get_job_scheduler_cmd()
+        log_debug('Command to launch vscode backend: %s', ' '.join(job_cmd))
+        job_env = self.get_job_env()
+        self.notify_will_launch_backend(cmd=job_cmd, env=job_env)
+        self._job_proc = subprocess.Popen(
+                job_cmd,
+                env=job_env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,  # equal text=True
+                bufsize=1,  # activates line buffering in text mode
+            )
+        log_info('Launched vscode backend with pid %d', self._job_proc.pid)
+        self.notify_did_launch_backend(self._job_proc)
+        
+        # Create the stdio monitoring threads:
+        self._proxy_threads[:] = [
+            threading.Thread(name=thread_name, target=thread_target, args=thread_args, daemon=True)
+            for thread_name, thread_target, thread_args in [
+                (
+                    "remote-stdin",
+                    self._stdin_proxy_fn,
+                    (sys.stdin, self._job_proc.stdin, proxy),
+                ),
+                (
+                    "remote-stdout",
+                    self._stdout_proxy_fn,
+                    (self._job_proc.stdout, sys.stdout, proxy),
+                ),
+                (
+                    "remote-stderr",
+                    self._stderr_proxy_fn,
+                    (self._job_proc.stderr, sys.stderr, proxy),
+                )
+            ]
+        ]
+        self.notify_did_create_stdio_threads(*self._proxy_threads)
+        for t in self._proxy_threads:
+            t.start()
+        self.notify_did_start_stdio_threads(*self._proxy_threads)
+        
+        return self
+    
+    def notify_will_launch_backend(self, cmd: Iterable[str], env: dict):
+        """A callback that can be implemented by subclasses to execute code immediately before the backend process is launched."""
+        pass
+    def notify_did_launch_backend(self, job_proc: 'subprocess.Popen'):
+        """A callback that can be implemented by subclasses to execute code after the backend process has been launched but before stdio monitoring threads have been created."""
+        pass
+    def notify_did_create_stdio_threads(self, stdin_thread, stdout_thread, stderr_thread):
+        """A callback that can be implemented by subclasses to execute code after the stdio monitoring threads have been created."""
+        pass
+    def notify_did_start_stdio_threads(self, stdin_thread, stdout_thread, stderr_thread):
+        """A callback that can be implemented by subclasses to execute code after the stdio monitoring threads have been started."""
+        pass
+
+    def stop(self):
+        """Stop the backend process and shutdown its i/o proxy threads.  Returns self so that methods can be chained."""
+        if '_job_proc' in self.__dict__:
+            log_info('Terminating vscode backend process...')
+            self.notify_will_terminate_backend(self._job_proc)
+            self._job_proc.terminate()
+            try:
+                self._job_proc.wait(timeout=self._cfg.__class__.DEFAULT_SUBPROCESS_WAIT_TIMEOUT)
+            except (OSError, subprocess.SubprocessError):
+                self._job_proc.kill()
+            self.notify_did_terminate_backend(self._job_proc)
+        return self
+    
+    def notify_will_terminate_backend(self, job_proc: 'subprocess.Popen'):
+        """A callback that can be implemented by subclasses to execute code immediately before the backend process is terminated."""
+        pass
+    def notify_did_terminate_backend(self, job_proc: 'subprocess.Popen'):
+        """A callback that can be implemented by subclasses to execute code immediately before the backend process is terminated."""
+        pass
+        
+    # Regex for input lines containing references to running servers bound to the localhost interface only:
+    RE_NODEJS_LOCALHOST = re.compile(
+            r'((\$args =.*)|(\$VSCH_SERVER_SCRIPT.*))--host=127.0.0.1')
+    RE_CLI_LISTENARGS_LOCALHOST = re.compile(
+            r'(LISTEN_ARGS=".*)(--on-host=(([0-9]+\.){3}[0-9]+))')
+    RE_CLI_CMD_LOCALHOST = re.compile(
+            r'(VSCODE_CLI_REQUIRE_TOKEN=[0-9a-fA-F-]*.*\$CLI_PATH.*command-shell )(.*)(--on-host=(([0-9]+\.){3}[0-9]+))')
+    
+    def _stdin_proxy_fn(self, src: TextIO, dst: TextIO, proxy: VSCodeTCPProxy):
+        """Consume input coming from the client and proxy it to the backend process's stdin.  Commands that provide CLI options or variable values that attempt to confine the backend to opening its binary TCP port on localhost are intercepted and altered.  If a stdin tee file was requested by the user, then all lines are mirrored to that file."""
+        # Check the config for a stdin tee file:
+        if self._cfg.tee_stdin_file:
+            has_stdin_log = True
+            stdin_log = open(self._cfg.tee_stdin_file, 'w')
+        else:
+            has_stdin_log = False
+            
+        # Start by sending our special `hostname` command:
+        cmd = f'echo "{self._cfg.__class__.SHELL_OUTPUT_PREFIX}HOSTNAME=$(hostname)"\n'
+        if has_stdin_log: stdin_log.write(cmd)
+        dst.write(cmd)
+        dst.flush()
+        log_debug('Wrote startup command to remote shell: %s', cmd)
+        
+        # Allow subclasses to send additional commands before we start proxying:
+        self.notify_stdin_ready(dst, stdin_log=stdin_log)
+
+        # state for the loop below
+        has_cli_listen_args = False
+
+        for line in iter(src.readline, ''):
+            m: 're.Match[str]|EllipsisType|None' = ...
+
+            # Fix localhost in commands:
+            if '--host=127.0.0.1' in line:
+                m = self.__class__.RE_NODEJS_LOCALHOST.search(line)
+                if m:
+                    log_debug('NODEJS localhost line found: %s', line)
+                    line = line.replace('127.0.0.1', '0.0.0.0')
+            elif not has_cli_listen_args and '"$CLI_PATH" command-shell' in line:
+                m = self.__class__.RE_CLI_CMD_LOCALHOST.search(line)
+                if m:
+                    log_debug('CLI_CMD localhost line found: %s', line)
+                    line = self.__class__.RE_CLI_CMD_LOCALHOST.sub(
+                        r'\g<1> --on-host=0.0.0.0 \g<2>', line
+                    )
+            elif 'LISTEN_ARGS=' in line:
+                m = self.__class__.RE_CLI_LISTENARGS_LOCALHOST.search(line)
+                if m:
+                    log_debug('CLI_LISTENARGS localhost line found: %s', line)
+                    line = self.__class__.RE_CLI_LISTENARGS_LOCALHOST.sub(
+                        r'\g<1> --on-host=0.0.0.0 ', line
+                    )
+                    has_cli_listen_args = True
+            
+            if m is not ...:
+                log_debug('localhost line found and fixed: %s', line)
+    
+            # Allow subclasses to possibly modify the line before passing it to the backend:
+            line = self.notify_did_read_stdin(line)
+            
+            # Write the line to the stdin log and the backend's stdin:
+            if has_stdin_log: stdin_log.write(line)
+            dst.write(line)
+            dst.flush()
+        
+        self.notify_did_close_stdin()
+        
+        # Close the stdin log file:
+        if has_stdin_log: stdin_log.close()
+
+        # All done, let everyone know:
+        proxy.set_state(ProxyStates.END, msg='stdin thread')
+    
+    def notify_stdin_ready(self, backend_stdin: TextIO, stdin_log: 'TextIO|None'):
+        """A callback that can be implemented by subclasses to execute code before commands from the client are proxied.  Can be used to send additional commands to the backend shell."""
+        pass
+    def notify_did_read_stdin(self, line: str) -> str:
+        """A callback that can be implemented by subclasses to execute code after a line is read from the client stdin.  The line can be modified but must ultimately be returned to the caller."""
+        return line
+    def notify_did_close_stdin(self):
+        """A callback that can be implemented by subclasses to execute code after the backend stdin has closed."""
+        pass
+
+    # Regex for the line output by the vscode backend indicating the TCP port on which it is listening:
+    RE_TARGET_PORT = re.compile(
+            r'^([^0-9]*listeningOn=[^0-9]*)(([0-9]+\.){3}[0-9]+:)?([0-9]+)([^0-9]*)$')
+
+    def _stdout_proxy_fn(self, src: TextIO, dst: TextIO, proxy: VSCodeTCPProxy):
+        """Consume output to the backend's stdout and write it to the client's stdout.  The lines must be scanned for output associated with commands issued by the _stdin_proxy_fn() thread.  In particular, the backend binary TCP port must be extracted from the output so that the binary TCP proxy can be told which port to connect with the client.
+
+When EOF is reached on the backend's stdout the state is incremented to END, yielding the shutdown of this script -- the connection to the remote shell has been severed.
+"""
+        # Check the config for a stdout tee file:
+        if self._cfg.tee_stdout_file:
+            has_stdout_log = True
+            stdout_log = open(self._cfg.tee_stdout_file, 'w')
+        else:
+            has_stdout_log = False
+            
+        listen_on_had_host = False
+        backend_port_line: 'str | None' = None
+        
+        # Allow subclasses to send additional output before we start proxying:
+        self.notify_stdout_ready(dst)
+
+        for line in iter(src.readline, ''):
+            omit = False  # forward the line to the destination
+
+            # Check if it's an injected command
+            if line.startswith(self._cfg.__class__.SHELL_OUTPUT_PREFIX):
+                line = str_removeprefix(line, self._cfg.__class__.SHELL_OUTPUT_PREFIX)
+                if line.startswith('HOSTNAME='):
+                    proxy.backend_host = str_removeprefix(line, 'HOSTNAME=').strip()
+                    log_info('Remote hostname found:  %s', proxy.backend_host)
+                omit = True
+
+            # Check if it contains the backend_port
+            elif proxy.backend_port is None and "listeningOn=" in line:
+                log_debug('Remote vscode TCP listener port found: %s', line)
+                m = self.__class__.RE_TARGET_PORT.search(line)
+                if m:
+                    proxy.backend_port = int(m.group(4))
+                    log_info('Remote TCP port found: %d', proxy.backend_port)
+                    if m.group(2):
+                        listen_on_had_host = m.group(2) != ''
+
+                # Don't print the line now, stash it for output once the TCP proxy
+                # has started:
+                omit = True
+                backend_port_line = line
+            
+            # Allow subclasses to see/alter the line if we didn't omit it:
+            if not omit: line = self.notify_did_read_stdout(line)
+            
+            if (proxy.state == ProxyStates.BEGIN
+                and proxy.backend_addr
+                and backend_port_line is not None
+            ):
+                # Before going any further, start the proxy:
+                proxy.set_state(ProxyStates.START_PROXY, msg='stdout thread')
+                
+                # Once it's started we can continue:
+                proxy.wait_for(
+                    ProxyStates.PROXY_STARTED,
+                    msg='stdout waiting for TCP Proxy startup...')
+
+                # Reformat the line with the local listening port:
+                target_host_str = '127.0.0.1:' if listen_on_had_host else ''
+                target_port_line = self.__class__.RE_TARGET_PORT.sub(
+                        rf'\g<1>{target_host_str:s}{proxy.backend_port:d}\g<5>',
+                        backend_port_line)
+                log_debug("Remote vscode TCP listener line rewritten: %s", backend_port_line)
+                if has_stdout_log: stdout_log.write(backend_port_line)
+                sys.stdout.write(backend_port_line)
+
+            if not omit:
+                if has_stdout_log: stdout_log.write(line)
+                sys.stdout.write(line)
+            sys.stdout.flush()
+        
+        self.notify_did_close_stdout()
+        
+        # Close the stdout log:
+        if has_stdout_log: stdout_log.close()
+
+        # All done, let everyone know:
+        proxy.set_state(ProxyStates.END, msg="stdout thread")
+    
+    def notify_stdout_ready(self, backend_stdin: TextIO):
+        """A callback that can be implemented by subclasses to execute code before output from the backend is proxied.  Can be used to send additional output to the client."""
+        pass
+    def notify_did_read_stdout(self, line: str) -> str:
+        """A callback that can be implemented by subclasses to execute code after a line is read from the backend stdout.  The line can be modified but must ultimately be returned to the caller."""
+        return line
+    def notify_did_close_stdout(self):
+        """A callback that can be implemented by subclasses to execute code after the client stdout has closed."""
+        pass
+    
+    def _stderr_proxy_fn(self, src: TextIO, dst: TextIO, proxy: VSCodeTCPProxy):
+        """Consume output to the backend's stderr and write it to this script's stderr."""
+        # Check the config for a stderr tee file:
+        if self._cfg.tee_stderr_file:
+            has_stderr_log = True
+            stderr_log = open(self._cfg.tee_stderr_file, 'w')
+        else:
+            has_stderr_log = False
+        
+        # Allow subclasses to send additional output before we start proxying:
+        self.notify_stderr_ready(dst)
+            
+        for line in iter(src.readline, ''):
+            line = self.notify_did_read_stderr(line)
+            if has_stderr_log: stderr_log.write(line)
+            dst.write(line)
+            dst.flush()
+            
+        self.notify_did_close_stderr()
+        
+        # Close the stderr log:
+        if has_stderr_log: stderr_log.close()
+    
+    def notify_stderr_ready(self, backend_stdin: TextIO):
+        """A callback that can be implemented by subclasses to execute code before output from the backend is proxied.  Can be used to send additional output to the client."""
+        pass
+    def notify_did_read_stderr(self, line: str) -> str:
+        """A callback that can be implemented by subclasses to execute code after a line is read from the backend stderr.  The line can be modified but must ultimately be returned to the caller."""
+        return line
+    def notify_did_close_stderr(self):
+        """A callback that can be implemented by subclasses to execute code after the client stderr has closed."""
+        pass
+
+# Set the default backend launcher class — a local proxy config script can alter this:
+VSCodeBackendLauncherClass = VSCodeBackendLauncher
+        
+
+
+async def primary_runloop(cfg, proxyClass, backendClass):
+    """The main asyncio event loop for the program.  Starts the binary TCP proxy and backend launcher, which will then synchronize between themselves to move the state forward.  We simply sit back and wait for the binary TCP proxy to transition to the END state, then cleanup the proxies and threads."""
+    # Get the binary TCP proxy created and ready to go:
+    tcp_proxy = proxyClass(cfg).start()
+    
+    # Get the backend launcher created and running:
+    backend_launcher = backendClass(cfg).start(tcp_proxy)
+    
+    # Block the main thread until the binary TCP proxy ends:
+    tcp_proxy.wait_for(ProxyStates.END, msg='Awaiting proxy termination')
+    
+    # Terminate the backend:
+    backend_launcher.stop()
+    
+    # Terminate the binary TCP proxy:
+    await tcp_proxy.stop()
+    
 
 #
 # Check for a local config script adjacent to this script on the filesystem.
@@ -450,16 +812,7 @@ if local_script_path:
 log_debug('Config class is "%s"', cfg.__class__.__name__)
 log_debug('Config initialized as %s', cfg.__dict__)
 
-
-
-
-
-tcp_proxy = VSCodeTCPProxyClass(cfg).start()
-tcp_proxy.backend_host = '127.0.0.1'
-tcp_proxy.backend_port = 22
-print(tcp_proxy)
-tcp_proxy.set_state(ProxyStates.START_PROXY, msg='Backend started')
-
-from time import sleep
-
-sleep(3000)
+#
+# Run the proxy:
+#
+asyncio_run(primary_runloop(cfg, proxyClass=VSCodeTCPProxyClass, backendClass=VSCodeBackendLauncherClass))
