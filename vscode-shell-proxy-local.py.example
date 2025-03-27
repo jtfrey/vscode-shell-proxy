@@ -1,8 +1,6 @@
 
 class VSCodeProxyConfigUD(VSCodeProxyConfig):
 
-    DEFAULT_VERBOSITY: int = 3
-
     @classmethod
     def cli_parser(cls):
         cli_parser = VSCodeProxyConfig.cli_parser()

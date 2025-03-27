@@ -100,6 +100,29 @@ Subclasses should:
     DEFAULT_CONN_BACKLOG: int = 8
     DEFAULT_READ_BYTE_LIMIT: int = 4096
     
+    @staticmethod
+    def load_local_script(global_ns=None, local_ns=None) -> 'str|None':
+        """Turn the path and filename of this script into a site-specific adjacent config file.  The string '-local' is added to the filename, e.g. 'script.py' => 'script-local.py'."""
+        our_fname = os.path.splitext(os.path.basename(__file__))
+        local_cfg_script = os.path.join(os.path.dirname(__file__), our_fname[0] + '-local' + our_fname[1])
+        if os.path.isfile(local_cfg_script):
+            try:
+                with open(local_cfg_script, 'r') as fptr:
+                    local_cfg_src = fptr.read()
+            except Exception as err:
+                sys.stderr.write('ERROR:  unable to open local proxy config script `{:s}'' for reading: {:s}\n'.format(local_cfg_script, str(err)))
+                sys.exit(-1)
+            try:
+                local_cfg_code = compile(local_cfg_src, local_cfg_script, 'exec')
+                exec(local_cfg_code, global_ns, local_ns)
+                return local_cfg_script
+            except Exception as err:
+                import traceback
+                sys.stderr.write('ERROR:  unable to execute local proxy config script:  {:s}\n'.format(str(err)))
+                traceback.print_tb(err.__traceback__, file=sys.stderr)
+                sys.exit(-1)
+        return None
+    
     @classmethod
     def cli_parser(cls):
         """The cli_parser() class method creates and returns an argparse instance that can parse command-line arguments for the proxy.  Site-specific extensions can be added by subclassing VSCodeProxyConfig and supplying a cli_parser() class method that chains to its parent class's method and uses add_argument() to augment the parser returned by the parent method."""
@@ -143,12 +166,12 @@ Subclasses should:
         cli_parser.add_argument('-H', '--listen-host', metavar='<HOSTNAME>',
                 dest='listen_host',
                 default=cls.DEFAULT_LISTEN_HOST,
-                help='the client-facing TCP proxy should bind to this interface (default {:s}; use 0.0.0.0 for all interfaces)'.format(cls.DEFAULT_LISTEN_HOST))
+                help='the client-facing TCP proxy should bind to this interface (default {:s}; 0.0.0.0 => all interfaces)'.format(cls.DEFAULT_LISTEN_HOST))
         cli_parser.add_argument('-p', '--listen-port', metavar='<N>',
                 dest='listen_port',
                 default=cls.DEFAULT_LISTEN_PORT,
                 type=int,
-                help='the client-facing TCP proxy port (default {:d})'.format(cls.DEFAULT_LISTEN_PORT))
+                help='the client-facing TCP proxy port (default {:d}; 0 => random port)'.format(cls.DEFAULT_LISTEN_PORT))
         cli_parser.add_argument('-S', '--salloc-arg', metavar='<SLURM-ARG>',
                 dest='salloc_args',
                 action='append',
@@ -165,10 +188,8 @@ Subclasses should:
     def __init__(self, **kwargs):
         """Initialize an instance of the class with default values augmented by keyword arguments (possibly coming from an argparse call)."""
         self.set_defaults()
-        print(self.verbosity)
         # Allow CLI arguments to override defaults:
-        super(VSCodeProxyConfig, self).__init__(**kwargs)
-        print(self.verbosity)
+        super(VSCodeProxyConfig, self).__init__(**kwargs)\
     
     def set_defaults(self):
         """Supply default values to instance variables in the receiver."""
@@ -416,32 +437,16 @@ VSCodeTCPProxyClass = VSCodeTCPProxy
 # Check for a local config script adjacent to this script on the filesystem.
 # If present, then execute that script in this context.
 #
-local_cfg_script = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'vscode-shell-proxy-local.py')
-if os.path.isfile(local_cfg_script):
-    try:
-        with open(local_cfg_script, 'r') as fptr:
-            local_cfg_src = fptr.read()
-    except Exception as err:
-        sys.stderr.write('ERROR:  unable to open local proxy config script for reading: {:s}\n'.format(str(err)))
-        sys.exit(-1)
-    try:
-        local_cfg_code = compile(local_cfg_src, local_cfg_script, 'exec')
-        exec(local_cfg_code)
-    except Exception as err:
-        import traceback
-        sys.stderr.write('ERROR:  unable to execute local proxy config script:  {:s}\n'.format(str(err)))
-        traceback.print_tb(err.__traceback__, file=sys.stderr)
-        sys.exit(-1)
-else:
-    local_cfg_script = ''
+local_script_path = VSCodeProxyConfig.load_local_script(global_ns=globals(), local_ns=locals())
+
 
 #
 # Get started by generating the configuration for the proxy from defaults
 # and CLI arguments:
 #
 cfg = VSCodeProxyConfigClass.create_with_cli_args().init_logging()
-if local_cfg_script:
-    log_info('Local configuration script executed from file "%s"', local_cfg_script)
+if local_script_path:
+    log_info('Loaded and executed local site config from `%s''', local_script_path)
 log_debug('Config class is "%s"', cfg.__class__.__name__)
 log_debug('Config initialized as %s', cfg.__dict__)
 
