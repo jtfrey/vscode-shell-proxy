@@ -54,7 +54,7 @@ class VSCodeBackendLauncherPoehlmann(VSCodeBackendLauncher):
         env_dict["XDG_RUNTIME_DIR"] = str(run_dir.absolute())
         return env_dict
     
-    def notify_stdin_ready(self, backend_stdin: TextIO, stdin_log: 'TextIO|None'):
+    def notify_stdin_ready(self, backend_stdin: TextIO, stdin_log: 'TextIO|None'=None):
         # Setup ssh-agent forwarding from the headnode to the node
         ssh_fwd_cmd = (
             "ssh -q -NfL ~/.ssh/$(hostname).sock:$LOGIN_SSH_AUTH_SOCK"

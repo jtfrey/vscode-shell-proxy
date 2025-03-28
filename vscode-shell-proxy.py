@@ -607,7 +607,7 @@ Subclasses should override this method to return site-specific mechanisms.  For 
         log_debug('Wrote startup command to remote shell: %s', cmd)
         
         # Allow subclasses to send additional commands before we start proxying:
-        self.notify_stdin_ready(dst, stdin_log=stdin_log)
+        self.notify_stdin_ready(dst, stdin_log=(stdin_log if has_stdin_log else None))
 
         # state for the loop below
         has_cli_listen_args = False
@@ -656,7 +656,7 @@ Subclasses should override this method to return site-specific mechanisms.  For 
         # All done, let everyone know:
         proxy.set_state(ProxyStates.END, msg='stdin thread')
     
-    def notify_stdin_ready(self, backend_stdin: TextIO, stdin_log: 'TextIO|None'):
+    def notify_stdin_ready(self, backend_stdin: TextIO, stdin_log: 'TextIO|None'=None):
         """A callback that can be implemented by subclasses to execute code before commands from the client are proxied.  Can be used to send additional commands to the backend shell."""
         pass
     def notify_did_read_stdin(self, line: str) -> str:
@@ -686,7 +686,7 @@ When EOF is reached on the backend's stdout the state is incremented to END, yie
         backend_port_line: 'str | None' = None
         
         # Allow subclasses to send additional output before we start proxying:
-        self.notify_stdout_ready(dst)
+        self.notify_stdout_ready(dst, stdout_log=(stdout_log if has_stdout_log else None))
 
         for line in iter(src.readline, ''):
             omit = False  # forward the line to the destination
@@ -751,7 +751,7 @@ When EOF is reached on the backend's stdout the state is incremented to END, yie
         # All done, let everyone know:
         proxy.set_state(ProxyStates.END, msg="stdout thread")
     
-    def notify_stdout_ready(self, backend_stdin: TextIO):
+    def notify_stdout_ready(self, backend_stdin: TextIO, stdout_log: 'TextIO|None'=None):
         """A callback that can be implemented by subclasses to execute code before output from the backend is proxied.  Can be used to send additional output to the client."""
         pass
     def notify_did_read_stdout(self, line: str) -> str:
@@ -771,7 +771,7 @@ When EOF is reached on the backend's stdout the state is incremented to END, yie
             has_stderr_log = False
         
         # Allow subclasses to send additional output before we start proxying:
-        self.notify_stderr_ready(dst)
+        self.notify_stderr_ready(dst, stderr_log=(stderr_log if has_stderr_log else None))
             
         for line in iter(src.readline, ''):
             line = self.notify_did_read_stderr(line)
@@ -784,7 +784,7 @@ When EOF is reached on the backend's stdout the state is incremented to END, yie
         # Close the stderr log:
         if has_stderr_log: stderr_log.close()
     
-    def notify_stderr_ready(self, backend_stdin: TextIO):
+    def notify_stderr_ready(self, backend_stdin: TextIO, stderr_log: 'TextIO|None'=None):
         """A callback that can be implemented by subclasses to execute code before output from the backend is proxied.  Can be used to send additional output to the client."""
         pass
     def notify_did_read_stderr(self, line: str) -> str:

@@ -98,7 +98,7 @@ class VSCodeBackendLauncherExample(VSCodeBackendLauncher):
         """A callback that can be implemented by subclasses to execute code immediately before the backend process is terminated."""
         pass
         
-    def notify_stdin_ready(self, backend_stdin: TextIO, stdin_log: 'TextIO|None'):
+    def notify_stdin_ready(self, backend_stdin: TextIO, stdin_log: 'TextIO|None'=None):
         """A callback that can be implemented by subclasses to execute code before commands from the client are proxied.  Can be used to send additional commands to the backend shell."""
         pass
     def notify_did_read_stdin(self, line: str) -> str:
@@ -108,7 +108,7 @@ class VSCodeBackendLauncherExample(VSCodeBackendLauncher):
         """A callback that can be implemented by subclasses to execute code after the backend stdin has closed."""
         pass
         
-    def notify_stdout_ready(self, backend_stdin: TextIO):
+    def notify_stdout_ready(self, backend_stdin: TextIO, stdout_log: 'TextIO|None'=None):
         """A callback that can be implemented by subclasses to execute code before output from the backend is proxied.  Can be used to send additional output to the client."""
         pass
     def notify_did_read_stdout(self, line: str) -> str:
@@ -118,7 +118,7 @@ class VSCodeBackendLauncherExample(VSCodeBackendLauncher):
         """A callback that can be implemented by subclasses to execute code after the client stdout has closed."""
         pass
 
-    def notify_stderr_ready(self, backend_stdin: TextIO):
+    def notify_stderr_ready(self, backend_stdin: TextIO, stderr_log: 'TextIO|None'=None):
         """A callback that can be implemented by subclasses to execute code before output from the backend is proxied.  Can be used to send additional output to the client."""
         pass
     def notify_did_read_stderr(self, line: str) -> str:
