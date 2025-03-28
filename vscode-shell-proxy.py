@@ -721,7 +721,7 @@ When EOF is reached on the backend's stdout the state is incremented to END, yie
             if not omit: line = self.notify_did_read_stdout(line)
             
             if (proxy.state == ProxyStates.BEGIN
-                and proxy.actual_listen_port
+                and proxy.backend_addr
                 and backend_port_line is not None
             ):
                 # Before going any further, start the proxy:
