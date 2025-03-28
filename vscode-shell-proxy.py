@@ -206,7 +206,7 @@ Subclasses should:
         """Initialize an instance of the class with default values augmented by keyword arguments (possibly coming from an argparse call)."""
         self.set_defaults()
         # Allow CLI arguments to override defaults:
-        super(VSCodeProxyConfig, self).__init__(**kwargs)\
+        super().__init__(**kwargs)
     
     def set_defaults(self):
         """Supply default values to instance variables in the receiver."""
@@ -459,7 +459,7 @@ class VSCodeBackendLauncher(object):
         # Initialize instance variables:
         self._proxy_threads: 'List[threading.Thread]' = []
     
-    def job_scheduler_base_cmd(self):
+    def job_scheduler_base_cmd(self) -> List[str]:
         """Return the baseline command array that is used to interactively start the vscode backend.  By default, the `bash` command is returned, which would start a local shell in which the vscode backend starts.
 
 Subclasses should override this method to return site-specific mechanisms.  For example, Slurm `salloc` with some standard options might return ['salloc', '--ntasks=1', '--partition=bigmem'].  Or for PBS, an interactive job would use ['qsub', '-I'].
@@ -487,15 +487,19 @@ Subclasses should override this method to return site-specific mechanisms.  For 
         log_debug('Command to launch vscode backend: %s', ' '.join(job_cmd))
         job_env = self.get_job_env()
         self.notify_will_launch_backend(cmd=job_cmd, env=job_env)
-        self._job_proc = subprocess.Popen(
-                job_cmd,
-                env=job_env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,  # equal text=True
-                bufsize=1,  # activates line buffering in text mode
-            )
+        try:
+            self._job_proc = subprocess.Popen(
+                    job_cmd,
+                    env=job_env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,  # equal text=True
+                    bufsize=1,  # activates line buffering in text mode
+                )
+        except Exception as e:
+            log_crit('Unable to launch vscode backend: %s', str(e))
+            sys.exit(-1)
         log_info('Launched vscode backend with pid %d', self._job_proc.pid)
         self.notify_did_launch_backend(self._job_proc)
         

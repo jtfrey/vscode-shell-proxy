@@ -19,7 +19,7 @@ VSCodeProxyConfigClass = VSCodeProxyConfigPoehlmann
 class VSCodeBackendLauncherPoehlmann(VSCodeBackendLauncher):
     """Backend launcher subclass that adds functionality associated with PR-3."""
 
-    def job_scheduler_base_cmd(self):
+    def job_scheduler_base_cmd(self) -> List[str]:
         import getpass
         user = (getpass.getuser() or "unknown").upper()
         return ["srun",
@@ -33,7 +33,7 @@ class VSCodeBackendLauncherPoehlmann(VSCodeBackendLauncher):
                 
     def get_job_scheduler_cmd(self) -> List[str]:
         """Augments the baseline command with the shell command."""
-        cmd = super(VSCodeBackendLauncherPoehlmann, self).get_job_scheduler_cmd()
+        cmd = super().get_job_scheduler_cmd()
         cmd.append("/bin/bash")
         return cmd
     
@@ -47,7 +47,7 @@ class VSCodeBackendLauncherPoehlmann(VSCodeBackendLauncher):
         run_dir = Path.home().joinpath(".run", short_uuid)
         run_dir.mkdir(exist_ok=True, parents=True)
         
-        env_dict = super(VSCodeBackendLauncherPoehlmann, self).get_job_env()
+        env_dict = super().get_job_env()
         # Store the head node's ssh_auth_sock location
         env_dict["LOGIN_SSH_AUTH_SOCK"] = os.environ.get("SSH_AUTH_SOCK", "")
         # Set the runtime dir on the node to a writable location unique to the job
