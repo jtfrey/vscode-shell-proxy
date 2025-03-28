@@ -70,11 +70,11 @@ At this point the procedure had outgrown implementation as Bash shell scripts.  
 
 ```
 usage: vscode-shell-proxy.py [-h] [-v] [-q] [-l <PATH>] [-0 <PATH>] [-1 <PATH>] [-2 <PATH>] [-b <N>] [-B <N>]
-                             [-H <HOSTNAME>] [-p <N>] [-g <WORKGROUP>] [-S <SLURM-ARG>]
+                             [-H <HOSTNAME>] [-p <N>] [-S <SALLOC-ARG>] [-g <WORKGROUP>]
 
 vscode remote shell proxy
 
-options:
+optional arguments:
   -h, --help            show this help message and exit
   -v, --verbose         increase the level of output as the program executes
   -q, --quiet           decrease the level of output as the program executes
@@ -94,20 +94,19 @@ options:
                         number of backlogged connections held by the proxy socket (see man page for listen(), default
                         8)
   -B <N>, --byte-limit <N>
-                        maximum bytes read at one time per socket (default 4096
+                        maximum bytes read at one time per socket (default 4096)
   -H <HOSTNAME>, --listen-host <HOSTNAME>
-                        the client-facing TCP proxy should bind to this interface (default 127.0.0.1; use 0.0.0.0 for
-                        all interfaces)
+                        the client-facing TCP proxy should bind to this interface (default 127.0.0.1; 0.0.0.0 => all
+                        interfaces)
   -p <N>, --listen-port <N>
-                        the client-facing TCP proxy port (default 0 implies a random port is chosen)
+                        the client-facing TCP proxy port (default 0; 0 => random port)
+  -S <SALLOC-ARG>, --salloc-arg <SALLOC-ARG>
+                        used zero or more times to specify arguments to the salloc command that launches the backend
   -g <WORKGROUP>, --group <WORKGROUP>, --workgroup <WORKGROUP>
                         the workgroup used to submit the vscode job
-  -S <SLURM-ARG>, --salloc-arg <SLURM-ARG>
-                        used zero or more times to specify arguments to the salloc command being wrapped (e.g.
-                        --partition=<name>, --ntasks=<N>)
 ```
 
-For the sake of debugging, the `--tee-*` and `--log-file` flags were of critical importance.  The `--group` and `--salloc-arg` flags removed the hard-coded values present in the original scripts.
+For the sake of debugging, the `--tee-*` and `--log-file` flags were of critical importance.  The `--group` and `--salloc-arg` flags removed the hard-coded values present in the original scripts.  See the [version 2.0.0](#v2.0.0) section in this document for additional information about the site-specific flags and behaviors of the script.
 
 The script worked:  intercepting the `listeningOn` line and holding it while the listener socket for the TCP proxying was added yielded (with "Enable Dynamic Forwarding" on) the originating connection's being able to connect to the TCP port on the login node.
 
@@ -123,7 +122,7 @@ The situation changed in early 2024 when Microsoft began deploying a binary remo
 
 ## Production setup
 
-The script requires Python 3.11, so a dedicated build of Python 3.11 was made from source and installed in `<install-prefix>/python-root`.  The proxy script was modified so that its hash-bang used `<install-prefix>/python-root/bin/python3` as its interpreter and the script was installed as `<install-prefix>/bin/vscode-shell-proxy.py`.
+The script requires Python 3, so a dedicated build of Python 3 was made from source and installed in `<install-prefix>/python-root`.  The proxy script was modified so that its hash-bang used `<install-prefix>/python-root/bin/python3` as its interpreter and the script was installed as `<install-prefix>/bin/vscode-shell-proxy.py`.
 
 The final settings used for the **Remote-SSH** extension were:
 
@@ -185,3 +184,11 @@ With a local X11 server running next to the VSCode application, the remote side 
 Anyone supporting users on HPC resources knows that documenting the appropriate way to do something on the system doesn't mean all users will find that information, read it, and employ it in their workflows.  With **Remote-SSH**, users who discover the tool will inevitably follow Microsoft's instructions and wind up leaving behind orphaned sessions on the login nodes, which will be noticed and prompt IT staff's contacting them to correct their behavior.
 
 The [vscode-cleanup.py](./vscode-cleanup.py) script attempts to help the situation by identifying vscode process trees whose root process is orphaned (ppid 1) and killing that process and its descendents.
+
+## <a name="v2.0.0"></a>Site-specific Modifications
+
+The original release of this script embedded many system-specific behaviors.  UD's clusters use the Slurm job scheduler and `salloc` is configured with acceptable default flags, so the backend shell was started quite simply with `salloc`.  The `salloc` must be executed with a specific workgroup gid selected, so the command is wrapped by our `workgroup` command.  None of this is likely usable by other sites, and that was proved in the code provided on PR #3.
+
+In version 2.0.0, the class-based refactoring of the script from PR #3 was used.  The runtime configuration was also encapsulated in a class.  A number of event-based notification methods were introduced into the classes, allowing subclasses to hook into the binary TCP proxy and backend launcher runloops, e.g. for the sake of sending additional commands to the backend shell or parsing stdout for additional information.
+
+The intention is for subclassing to be used to extend the functionality of the baseline script.  Sites need not modify `vscode-shell-proxy.py`; rather, in the same directory as that script a `vscode-shell-proxy-local.py` source file is loaded, compiled, and executed at runtime.  The code in that local config script should include subclasses that implement the site-specific behaviors.  See the [vscode-shell-proxy-local.example.py](./vscode-shell-proxy-local.example.py) script for template subclasses.  The site-specific modifications necessary for UD's clusters and for the PR #3 contributor's system are encapsulated in the [vscode-shell-proxy-local.UDelDarwin.py](./vscode-shell-proxy-local.UDelDarwin.py) and [vscode-shell-proxy-local.Poehlmann.py](./vscode-shell-proxy-local.Poehlmann.py) scripts, respectively.

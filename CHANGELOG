@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Config, binary TCP proxy, and backend launcher classes generalized to remove site-specific details
+- Config, binary TCP proxy, and backend launcher classes contain event-oriented notification methods that hook subclasses into the class's runloop
+- Site-local modifications can be implemented as subclasses in a Python source file adjacent to the main script
+
+### Changed
+- Code-refactoring by Andreas Poehlmann:  procedural functionality encapsulated into classes
+- Changes for compatibility with Python 3.x releases older than 3.11
+
 
 ## [1.0.0] - 2024-09-20
 
