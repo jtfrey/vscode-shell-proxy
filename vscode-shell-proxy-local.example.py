@@ -5,7 +5,7 @@
 class VSCodeProxyConfigExample(VSCodeProxyConfig):
     """Configuration subclass template.  Delete methods that you do not need."""
     
-    # We use the Slurm job scheduler and the `salloc` command to start interactive jobs:
+    # Descriptive single-word name of your backend process launcher (e.g. 'salloc'):
     SCHEDULER_NAME: str = 'name of your backend process launcher'
 
     @classmethod
