@@ -119,25 +119,33 @@ Subclasses should:
     
     @staticmethod
     def load_local_script(global_ns=None, local_ns=None) -> 'str|None':
-        """Turn the path and filename of this script into a site-specific adjacent config file.  The string '-local' is added to the filename, e.g. 'script.py' => 'script-local.py'."""
+        """Turn the path and filename of this script into a site-specific adjacent config file.  The string '-local' is added to the filename, e.g. 'script.py' => 'script-local.py'.  If this script was executed from a symlink, also check adjacent to the real path to the script."""
         our_fname = os.path.splitext(os.path.basename(__file__))
-        local_cfg_script = os.path.join(os.path.dirname(__file__), our_fname[0] + '-local' + our_fname[1])
-        if os.path.isfile(local_cfg_script):
-            try:
-                with open(local_cfg_script, 'r') as fptr:
-                    local_cfg_src = fptr.read()
-            except Exception as err:
-                sys.stderr.write('ERROR:  unable to open local proxy config script `{:s}'' for reading: {:s}\n'.format(local_cfg_script, str(err)))
-                sys.exit(-1)
-            try:
-                local_cfg_code = compile(local_cfg_src, local_cfg_script, 'exec')
-                exec(local_cfg_code, global_ns, local_ns)
-                return local_cfg_script
-            except Exception as err:
-                import traceback
-                sys.stderr.write('ERROR:  unable to execute local proxy config script:  {:s}\n'.format(str(err)))
-                traceback.print_tb(err.__traceback__, file=sys.stderr)
-                sys.exit(-1)
+        local_cfg_script = [os.path.join(os.path.dirname(__file__), our_fname[0] + '-local' + our_fname[1])]
+        
+        # If this script was executed from a symlink, then dereference the symlink and also look for a config
+        # file adjacent in that directory:
+        realpath_cfg_script = os.path.join(os.path.dirname(os.path.realpath(__file__)), our_fname[0] + '-local' + our_fname[1])
+        if realpath_cfg_script not in local_cfg_script:
+            local_cfg_script.append(realpath_cfg_script)
+            
+        for cfg_path in local_cfg_script:
+            if os.path.isfile(cfg_path):
+                try:
+                    with open(cfg_path, 'r') as fptr:
+                        local_cfg_src = fptr.read()
+                except Exception as err:
+                    sys.stderr.write('ERROR:  unable to open local proxy config script `{:s}'' for reading: {:s}\n'.format(cfg_path, str(err)))
+                    sys.exit(-1)
+                try:
+                    local_cfg_code = compile(local_cfg_src, cfg_path, 'exec')
+                    exec(local_cfg_code, global_ns, local_ns)
+                    return cfg_path
+                except Exception as err:
+                    import traceback
+                    sys.stderr.write('ERROR:  unable to execute local proxy config script:  {:s}\n'.format(str(err)))
+                    traceback.print_tb(err.__traceback__, file=sys.stderr)
+                    sys.exit(-1)
         return None
     
     @classmethod
