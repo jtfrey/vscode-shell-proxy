@@ -734,9 +734,9 @@ When EOF is reached on the backend's stdout the state is incremented to END, yie
                 target_port_line = self.__class__.RE_TARGET_PORT.sub(
                         rf'\g<1>{target_host_str:s}{proxy.backend_port:d}\g<5>',
                         backend_port_line)
-                log_debug("Remote vscode TCP listener line rewritten: %s", backend_port_line)
-                if has_stdout_log: stdout_log.write(backend_port_line)
-                sys.stdout.write(backend_port_line)
+                log_debug("Remote vscode TCP listener line rewritten: %s", target_port_line)
+                if has_stdout_log: stdout_log.write(target_port_line)
+                sys.stdout.write(target_port_line)
 
             if not omit:
                 if has_stdout_log: stdout_log.write(line)
