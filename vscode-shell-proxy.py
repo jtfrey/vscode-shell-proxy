@@ -207,6 +207,16 @@ Subclasses should:
         self.set_defaults()
         # Allow CLI arguments to override defaults:
         super().__init__(**kwargs)
+        
+        # Replace tokens in log and tee file names:
+        if self.log_file:
+            self.log_file = self.log_file.replace('[PID]', str(os.getpid()))
+        if self.tee_stdin_file:
+            self.tee_stdin_file = self.tee_stdin_file.replace('[PID]', str(os.getpid()))
+        if self.tee_stdout_file:
+            self.tee_stdout_file = self.tee_stdout_file.replace('[PID]', str(os.getpid()))
+        if self.tee_stderr_file:
+            self.tee_stderr_file = self.tee_stderr_file.replace('[PID]', str(os.getpid()))
     
     def set_defaults(self):
         """Supply default values to instance variables in the receiver."""
@@ -229,9 +239,6 @@ Subclasses should:
         chosen_logging_level = self.__class__.BASE_LOGGING_LEVEL + self.verbosity - self.quietness
         # ...and limit to our range of levels:
         chosen_logging_level = min(max(0, chosen_logging_level), len(self.__class__.LOGGING_LEVELS)-1)
-        if self.log_file:
-            # Replace tokens in the log file name:
-            self.log_file = self.log_file.replace('[PID]', str(os.getpid()))
         # Configure the logging class:
         logging.basicConfig(filename=self.log_file,
                             level=self.__class__.LOGGING_LEVELS[chosen_logging_level],
