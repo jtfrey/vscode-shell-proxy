@@ -192,3 +192,24 @@ The original release of this script embedded many system-specific behaviors.  UD
 In version 2.0.0, the class-based refactoring of the script from PR #3 was used.  The runtime configuration was also encapsulated in a class.  A number of event-based notification methods were introduced into the classes, allowing subclasses to hook into the binary TCP proxy and backend launcher runloops, e.g. for the sake of sending additional commands to the backend shell or parsing stdout for additional information.
 
 The intention is for subclassing to be used to extend the functionality of the baseline script.  Sites need not modify `vscode-shell-proxy.py`; rather, in the same directory as that script a `vscode-shell-proxy-local.py` source file is loaded, compiled, and executed at runtime.  The code in that local config script should include subclasses that implement the site-specific behaviors.  See the [vscode-shell-proxy-local.example.py](./vscode-shell-proxy-local.example.py) script for template subclasses.  The site-specific modifications necessary for UD's clusters and for the PR #3 contributor's system are encapsulated in the [vscode-shell-proxy-local.UDelDarwin.py](./vscode-shell-proxy-local.UDelDarwin.py) and [vscode-shell-proxy-local.Poehlmann.py](./vscode-shell-proxy-local.Poehlmann.py) scripts, respectively.
+
+For example, we can install the **vscode-shell-proxy** in a versioned hierarchy:
+
+```bash
+$ mkdir /opt/shared/vscode-shell-proxy
+$ cd /opt/shared/vscode-shell-proxy
+$ git clone https://github.com/jtfrey/vscode-shell-proxy.git src
+$ cd src
+$ git checkout v2.0.0
+$ mkdir ../2.0.0
+$ cp vscode-shell-proxy.py ../2.0.0
+$ cp vscode-shell-proxy-local-example.py ../2.0.0/vscode-shell-proxy-local.py
+```
+
+Assuming we edit the `/opt/shared/vscode-shell-proxy/2.0.0/vscode-shell-proxy-local.py` file, we can install a symlink in `/usr/local/bin`:
+
+```bash
+$ sudo ln -s /opt/shared/vscode-shell-proxy/2.0.0/vscode-shell-proxy.py /usr/local/bin/vscode-shell-proxy
+```
+
+So long as `/usr/local/bin` is on the user's PATH, the `vscode-shell-proxy` command is available.  The script will first check for a local config adjacent to the symlink (`/usr/local/bin/vscode-shell-proxy-local.py`) and if that is not present, it will resolve the symlink and check adjacent to the target (`/opt/shared/vscode-shell-proxy/2.0.0/vscode-shell-proxy-local.py`).

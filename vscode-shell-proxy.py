@@ -120,7 +120,10 @@ Subclasses should:
     @staticmethod
     def load_local_script(global_ns=None, local_ns=None) -> 'str|None':
         """Turn the path and filename of this script into a site-specific adjacent config file.  The string '-local' is added to the filename, e.g. 'script.py' => 'script-local.py'.  If this script was executed from a symlink, also check adjacent to the real path to the script."""
-        our_fname = os.path.splitext(os.path.basename(__file__))
+        # Use realpath so that a symlink w/o the .py extension gains it back...
+        our_fname = os.path.splitext(os.path.basename(os.path.realpath(__file__)))
+        
+        # Local config path relative to the directory containing the invoked command:
         local_cfg_script = [os.path.join(os.path.dirname(__file__), our_fname[0] + '-local' + our_fname[1])]
         
         # If this script was executed from a symlink, then dereference the symlink and also look for a config
