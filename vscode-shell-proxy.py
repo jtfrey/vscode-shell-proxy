@@ -285,6 +285,9 @@ The instance listens on TCP <host>:<port> indicated by the VSCodeProxyConfig obj
         # Retain a reference to the configuration:
         self._cfg = cfg
         
+        # This is the TCP port on which we'll listen for binary TCP proxy connections:
+        self.actual_listen_port: "int|None" = None
+        
         # This is the remote (compute node) host id and TCP port on which vscode backend is listening:
         self.backend_host: "str|None" = None
         self.backend_port: "int|None" = None
@@ -718,7 +721,7 @@ When EOF is reached on the backend's stdout the state is incremented to END, yie
             if not omit: line = self.notify_did_read_stdout(line)
             
             if (proxy.state == ProxyStates.BEGIN
-                and proxy.backend_addr
+                and proxy.actual_listen_port
                 and backend_port_line is not None
             ):
                 # Before going any further, start the proxy:
@@ -732,7 +735,7 @@ When EOF is reached on the backend's stdout the state is incremented to END, yie
                 # Reformat the line with the local listening port:
                 target_host_str = '127.0.0.1:' if listen_on_had_host else ''
                 target_port_line = self.__class__.RE_TARGET_PORT.sub(
-                        rf'\g<1>{target_host_str:s}{proxy.backend_port:d}\g<5>',
+                        rf'\g<1>{target_host_str:s}{proxy.actual_listen_port:d}\g<5>',
                         backend_port_line)
                 log_debug("Remote vscode TCP listener line rewritten: %s", target_port_line)
                 if has_stdout_log: stdout_log.write(target_port_line)
