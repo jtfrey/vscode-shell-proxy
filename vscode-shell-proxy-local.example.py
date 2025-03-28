@@ -56,7 +56,7 @@ class VSCodeTCPProxyExample(VSCodeTCPProxy):
         pass
         
 # Tell the main script to use this subclass to handle the binary TCP proxy:
-VSCodeTCPProxyClass = VSCodeTCPProxy
+VSCodeTCPProxyClass = VSCodeTCPProxyExample
 
 
 class VSCodeBackendLauncherExample(VSCodeBackendLauncher):
