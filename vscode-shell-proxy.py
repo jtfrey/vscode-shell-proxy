@@ -204,6 +204,10 @@ Subclasses should:
                 dest='scheduler_args',
                 action='append',
                 help='used zero or more times to specify arguments to the {:s} command that launches the backend'.format(cls.SCHEDULER_NAME))
+        cli_parser.add_argument('-e', '--{:s}-env'.format(cls.SCHEDULER_NAME), metavar='<{:s}-ENV>'.format(cls.SCHEDULER_NAME.upper()),
+                dest='scheduler_envs',
+                action='append',
+                help='used zero or more times to specify environment variables that should be added when the backend is launched; format should be <variable-name>{=<value>}')
         return cli_parser
     
     @classmethod
@@ -497,7 +501,12 @@ Subclasses should override this method to return site-specific mechanisms.  For 
         
     def get_job_env(self) -> dict:
         """Returns a dictionary containing the key-value pairs that should be present in the backend subprocess's environment."""
-        return { **os.environ }
+        base_env = { **os.environ }
+        if self._cfg.scheduler_envs:
+            for env_spec in self._cfg.scheduler_envs:
+                e, v = env_spec.split('=', 1) if '=' in env_spec else (env_spec, '')
+                base_env[e.upper()] = v
+        return base_env
 
     def start(self, proxy: VSCodeTCPProxy):
         """Start the backend process and plumb its i/o proxy threads.  Returns self so that methods can be chained."""

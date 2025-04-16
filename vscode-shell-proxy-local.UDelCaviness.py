@@ -80,7 +80,7 @@ class VSCodeBackendLauncherUDelDARWIN(VSCodeBackendLauncher):
             for env_spec in self._cfg.scheduler_envs:
                 e, _ = env_spec.split('=', 1) if '=' in env_spec else (env_spec, '')
                 envs += ',' + e
-        cmd.extend(('srun', '--mpi=none', '--interactive', '--preserve-env', '--pty', '--export='+envs, '$SHELL', '-l'))
+        cmd.extend(('srun', '--mpi=none', '--pty', '--cpu-bind=none', '--export='+envs, '$SHELL', '-l'))
         return cmd
 
 VSCodeBackendLauncherClass = VSCodeBackendLauncherUDelDARWIN
